@@ -1,0 +1,27 @@
+# ── Dependencias ──
+node_modules/
+
+# ── Builds ──
+dist/
+build/
+
+# ── Entorno / secretos (NUNCA versionar) ──
+.env
+.env.*
+!.env.example
+
+# ── Runtime portable de Node (no versionar binarios) ──
+_node/
+
+# ── Pruebas locales de conexión ──
+_dbtest/node_modules/
+
+# ── Logs y basura del sistema ──
+*.log
+.DS_Store
+Thumbs.db
+
+# ── Repos anidados: cada uno tiene su propio remoto (Api-App, etc.) ──
+gateway/
+back-turnos/
+front-turnos/

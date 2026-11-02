@@ -1,0 +1,45 @@
+{
+  "name": "ommex-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend unificado Ommex (dominios turnos y trazabilidad) con una única capa de acceso a MongoDB",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.901.0",
+    "@aws-sdk/s3-request-presigner": "^3.901.0",
+    "@hapi/boom": "^10.0.1",
+    "@simplewebauthn/server": "^13.3.2",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb": "^6.16.0",
+    "nanoid": "^5.1.5",
+    "nodemailer": "^7.0.4",
+    "pdfjs-dist": "^6.0.1",
+    "pino": "^9.14.0",
+    "qrcode": "^1.5.4",
+    "swagger-ui-express": "^5.0.1",
+    "twilio": "^6.0.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.15.0",
+    "@types/nodemailer": "^7.0.2",
+    "@types/qrcode": "^1.5.6",
+    "@types/swagger-ui-express": "^4.1.8",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

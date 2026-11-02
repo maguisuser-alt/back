@@ -1,0 +1,26 @@
+# Configuración de Fly.io para el backend unificado de Ommex.
+# Un solo proceso sirve /turnos y /trazabilidad sobre el mismo pool de MongoDB.
+# El gateway (ommex-gateway) enruta aquí vía UNIFIED_BACKEND_URL.
+app = "ommex-backend"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "4000"
+  NODE_ENV = "production"
+
+[http_service]
+  internal_port = 4000
+  force_https = true
+  # Always-on: mantiene las sesiones de WhatsApp (Baileys) y el job de
+  # autocierre, por lo que la máquina NUNCA debe apagarse ni suspenderse.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # 512 MB: el proceso sostiene dos dominios y varias sesiones de Baileys.
+  memory = "512mb"

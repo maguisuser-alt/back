@@ -1,0 +1,77 @@
+# ══════════════════════════════════════════════════════════════════════════
+# render.yaml — Ommex: backend unificado en Render (Blueprint)
+#
+# Despliega UN solo servicio web (plan Free) que agrupa los tres dominios:
+#   /turnos/api/...        TURNOS
+#   /trazabilidad/api/...  TRAZABILIDAD
+#   /academia/api/...      ACADEMIA
+#
+# NO se despliega el gateway: el backend ya sirve los tres prefijos desde una
+# sola URL, y en el plan Free solo UN servicio puede estar always-on (750 h/mes
+# compartidas por workspace). Ver README.md.
+#
+# Requisito: este repositorio debe estar en GitHub/GitLab/Bitbucket.
+# Render construye la imagen con backend/Dockerfile (multi-stage node:22-slim).
+# ══════════════════════════════════════════════════════════════════════════
+
+services:
+  - type: web
+    name: ommex-backend
+    runtime: docker
+    plan: free
+    region: oregon          # us-west; la más cercana a México
+    rootDir: backend        # contexto de build = carpeta backend/
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+
+    # Render inyecta PORT automáticamente; el backend escucha en process.env.PORT.
+    envVars:
+      # ── MongoDB Atlas (un solo clúster para las 3 bases) ──
+      # sync: false = valor secreto, se rellena desde el panel de Render.
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_TURNOS
+        value: ommex_register
+      - key: MONGODB_DB_TRAZABILIDAD
+        value: pluscargo_logging
+      - key: MONGODB_DB_ACADEMIA
+        value: ommex_academia
+
+      # ── Autenticación (secretos por dominio) ──
+      - key: JWT_SECRET
+        sync: false
+      - key: AUTH_TOKEN_SECRET
+        sync: false
+
+      # ── WhatsApp (Baileys). Requiere proceso siempre activo. ──
+      - key: ENABLE_WHATSAPP_TURNOS
+        value: "true"
+      - key: ENABLE_WHATSAPP_WEB
+        value: "true"
+
+      # ── URLs públicas / CORS ──
+      - key: APP_PUBLIC_URL
+        sync: false
+
+# ══════════════════════════════════════════════════════════════════════════
+# OPCIONAL: gateway reverse-proxy.
+#
+# El backend ya expone /turnos, /trazabilidad y /academia, así que el gateway
+# es REDUNDANTE para este despliegue. Además, tenerlo siempre activo junto al
+# backend supera las 750 h/mes gratuitas y Render suspende TODOS los servicios
+# Free. Súbelo solo si necesitas el contrato de "una sola URL" y aceptas pagar
+# (plan starter) o que se enfríe (spin-down al quedar ocioso).
+#
+#  - type: web
+#    name: ommex-gateway
+#    runtime: docker
+#    plan: free
+#    region: oregon
+#    rootDir: gateway
+#    dockerfilePath: ./Dockerfile
+#    healthCheckPath: /health
+#    envVars:
+#      - key: UNIFIED_BACKEND_URL
+#        value: https://ommex-backend.onrender.com
+# ══════════════════════════════════════════════════════════════════════════
