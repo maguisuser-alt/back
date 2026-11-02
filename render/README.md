@@ -54,35 +54,35 @@ el Free.
 
 ---
 
-## 3. Prerrequisito: repositorio Git
+## 3. Repositorio (ya publicado)
 
-Render **solo** despliega desde GitHub, GitLab o Bitbucket (o una imagen en un
-registry). **Este workspace todavía NO es un repositorio Git**, así que el paso
-0 es publicarlo:
+El código ya está en GitHub, rama `main`:
+
+- **Repo:** https://github.com/maguisuser-alt/back
+- **Contenido:** `backend/`, `render/`, `render.yaml` y `.gitignore`
+
+Para subir cambios posteriores:
 
 ```powershell
 cd e:\documentos\proyect\ommex_register
-git init
-git add backend gateway render
-git commit -m "Backend unificado Ommex + config de despliegue en Render"
-git branch -M main
-git remote add origin https://github.com/<usuario>/<repo>.git
-git push -u origin main
+git add backend render render.yaml
+git commit -m "cambios"
+git push
 ```
 
-> `.gitignore` de `backend/` ya protege `node_modules`, `dist` y `.env`.
+> `.gitignore` protege `node_modules`, `dist`, `.env` y los repos anidados.
 > Verifica con `git status` que `.env` NO se sube antes de hacer push.
 
 ---
 
 ## 4. Despliegue (Blueprint `render.yaml`)
 
-El archivo [`render.yaml`](./render.yaml) define el servicio. Dos formas:
+El archivo [`render.yaml`](../render.yaml) (raíz del repo) define el servicio. Dos formas:
 
 ### A. Desde el panel (recomendado)
 
 1. Render Dashboard → **New +** → **Blueprint**.
-2. Conecta el repositorio. Render detecta `render/render.yaml`.
+2. Conecta el repositorio. Render detecta `render.yaml` en la raíz.
 3. Rellena los secretos (`sync: false`) cuando los pida:
    `MONGODB_URI`, `JWT_SECRET`, `AUTH_TOKEN_SECRET`, `APP_PUBLIC_URL`.
 4. **Apply** → Render construye con `backend/Dockerfile` y publica.
