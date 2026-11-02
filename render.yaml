@@ -20,8 +20,8 @@ services:
     runtime: docker
     plan: free
     region: oregon          # us-west; la más cercana a México
-    rootDir: backend        # contexto de build = carpeta backend/
-    dockerfilePath: ./Dockerfile
+    dockerfilePath: ./backend/Dockerfile   # relativo a la raíz del repo
+    dockerContext: ./backend               # contexto de build = carpeta backend/
     healthCheckPath: /health
     autoDeploy: true
 

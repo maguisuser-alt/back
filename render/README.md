@@ -95,8 +95,9 @@ El archivo [`render.yaml`](../render.yaml) (raíz del repo) define el servicio. 
 ### B. Con la API/CLI de Render
 
 Puedes crear el servicio con la API (`POST /v1/services`) apuntando a
-`repo`, `branch`, `rootDir: backend`, `dockerfilePath: Dockerfile`,
-`plan: free`, `healthCheckPath: /health`. Requiere una API key de Render.
+`repo`, `branch: main`, `dockerfilePath: ./backend/Dockerfile`,
+`dockerContext: ./backend`, `plan: free`, `healthCheckPath: /health`.
+Requiere una API key de Render.
 
 ---
 
