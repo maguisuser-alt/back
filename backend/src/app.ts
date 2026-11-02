@@ -26,11 +26,17 @@ export const app = express()
 // ETag desactivado: evita 304 con cuerpo vacío en el polling de operaciones.
 app.set('etag', false)
 
+// Dev local: CUALQUIER puerto en `localhost` o `127.0.0.1`. Vite imprime la URL
+// como http://127.0.0.1:517x, que antes no estaba en la lista blanca: el
+// navegador bloqueaba TODAS las peticiones al backend y el front lo mostraba
+// como error de red genérico ("El servidor está iniciando..."), aunque el
+// servidor estuviera arriba. Un `origin` no permitido deja la respuesta sin
+// `Access-Control-Allow-Origin` y el navegador descarta la respuesta.
+const LOCAL_DEV_ORIGIN = /^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/
+
 app.use(cors({
   origin: [
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:5175',
+    LOCAL_DEV_ORIGIN,
     'https://asignacion-register.vercel.app',
     /\.vercel\.app$/,
     /\.onrender\.com$/,

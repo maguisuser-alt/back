@@ -48,17 +48,34 @@ export function isWhatsAppWebEnabled(): boolean {
   return manager.isEnabled()
 }
 
-export function getStatus(companyId?: string) {
-  return manager.getStatus(companyId)
+export function getStatus(companyId?: string, userId?: string) {
+  return manager.getStatus(companyId, userId)
 }
 
-export function getQrDataUrl(companyId?: string): string | null {
-  return manager.getQrDataUrl(companyId)
+export function getQrDataUrl(companyId?: string, userId?: string): string | null {
+  return manager.getQrDataUrl(companyId, userId)
 }
 
-/** Inicia (o reutiliza) la conexión con WhatsApp Web para una compañía. Idempotente. */
-export async function startWhatsAppWeb(companyId?: string): Promise<void> {
-  return manager.start(companyId)
+/** Código de vinculación (pairing code) pendiente, o null. */
+export function getPairingCode(companyId?: string, userId?: string): string | null {
+  return manager.getPairingCode(companyId, userId)
+}
+
+/**
+ * Solicita un código de vinculación para un número (alternativa al QR).
+ * `phoneNumber` en formato internacional solo dígitos (p. ej. 573001234567).
+ */
+export async function requestPairingCode(
+  companyId: string | undefined,
+  userId: string | undefined,
+  phoneNumber: string,
+): Promise<string> {
+  return manager.requestPairingCode(companyId, userId, phoneNumber)
+}
+
+/** Inicia (o reutiliza) la conexión con WhatsApp Web para una compañía/usuario. Idempotente. */
+export async function startWhatsAppWeb(companyId?: string, userId?: string): Promise<void> {
+  return manager.start(companyId, userId)
 }
 
 /**
@@ -78,8 +95,8 @@ export function resumeSavedSessions(): Promise<void> {
 export const toJid = toJidShared
 
 /** Envía texto a un número o grupo. */
-export async function sendText(to: string, text: string, companyId?: string): Promise<{ id: string | null }> {
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, { text })
+export async function sendText(to: string, text: string, companyId?: string, userId?: string): Promise<{ id: string | null }> {
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, { text })
   return { id: res?.key?.id ?? null }
 }
 
@@ -115,7 +132,7 @@ async function fetchImageBuffer(url: string, retries = 2): Promise<Buffer | null
 }
 
 /** Envía una imagen (desde Buffer o URL) a un número o grupo, con caption opcional. */
-export async function sendImage(to: string, image: Buffer | string, caption?: string, companyId?: string): Promise<{ id: string | null }> {
+export async function sendImage(to: string, image: Buffer | string, caption?: string, companyId?: string, userId?: string): Promise<{ id: string | null }> {
   // Si es URL, descargamos los bytes nosotros (robusto) antes de enviar; si
   // falla la descarga, caemos al método anterior (Baileys hace el fetch) para
   // no perder el caso en que la URL sí sea descargable solo por Baileys.
@@ -126,12 +143,12 @@ export async function sendImage(to: string, image: Buffer | string, caption?: st
   } else {
     img = image
   }
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, { image: img, caption })
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, { image: img, caption })
   return { id: res?.key?.id ?? null }
 }
 
 /** Envía un audio (desde Buffer o URL) a un número o grupo. */
-export async function sendAudio(to: string, audio: Buffer | string, companyId?: string, mimetype?: string): Promise<{ id: string | null }> {
+export async function sendAudio(to: string, audio: Buffer | string, companyId?: string, mimetype?: string, userId?: string): Promise<{ id: string | null }> {
   const aud = typeof audio === 'string' ? { url: audio } : audio
   const m = (mimetype || '').toLowerCase()
   const url = typeof audio === 'string' ? audio : ''
@@ -142,13 +159,13 @@ export async function sendAudio(to: string, audio: Buffer | string, companyId?: 
 
   if (looksOgg || looksMp4) {
     const finalMime = looksMp4 ? 'audio/mp4' : 'audio/ogg; codecs=opus'
-    const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, { audio: aud, mimetype: finalMime, ptt: true })
+    const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, { audio: aud, mimetype: finalMime, ptt: true })
     return { id: res?.key?.id ?? null }
   }
 
   if (looksWebm || !looksOgg) {
     const fileName = `audio.${looksWebm ? 'webm' : 'bin'}`
-    const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, {
+    const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
       document: aud,
       fileName,
       mimetype: m || 'audio/webm',
@@ -157,7 +174,7 @@ export async function sendAudio(to: string, audio: Buffer | string, companyId?: 
     return { id: res?.key?.id ?? null }
   }
 
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, { audio: aud, mimetype: 'audio/ogg; codecs=opus', ptt: true })
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, { audio: aud, mimetype: 'audio/ogg; codecs=opus', ptt: true })
   return { id: res?.key?.id ?? null }
 }
 
@@ -167,12 +184,13 @@ export async function sendDocument(
   document: Buffer | string,
   opts: { fileName?: string; caption?: string; mimetype?: string } = {},
   companyId?: string,
+  userId?: string,
 ): Promise<{ id: string | null }> {
   const doc = typeof document === 'string' ? { url: document } : document
   const docMessage: Record<string, unknown> = { document: doc, fileName: opts.fileName ?? 'documento' }
   if (opts.caption) docMessage.caption = opts.caption
   if (opts.mimetype) docMessage.mimetype = opts.mimetype
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, docMessage)
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, docMessage)
   return { id: res?.key?.id ?? null }
 }
 
@@ -187,12 +205,13 @@ export async function sendAlbum(
   images: Array<string | Buffer>,
   caption?: string,
   companyId?: string,
+  userId?: string,
 ): Promise<{ id: string | null; count: number }> {
   if (images.length === 0) return { id: null, count: 0 }
 
   // 0. Espera a que la conexión esté abierta (reconexión incluida) antes de
   //    enviar; si tras el margen sigue caída, lanza un error claro con guía.
-  await manager.waitForOpen(companyId)
+  await manager.waitForOpen(companyId, userId)
 
   // 1. Descarga TODAS las imágenes a Buffer primero (robusto). Las que no se
   //    puedan descargar se omiten, pero no rompen el resto del álbum.
@@ -219,7 +238,7 @@ export async function sendAlbum(
   let count = 0
   for (let i = 0; i < buffers.length; i++) {
     try {
-      const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, {
+      const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
         image: buffers[i],
         // El caption va en la PRIMERA imagen enviada con éxito.
         ...(count === 0 && caption ? { caption } : {}),
@@ -255,8 +274,9 @@ export async function sendImageFromGitHub(
   caption?: string,
   opts: { path?: string; fileName?: string } = {},
   companyId?: string,
+  userId?: string,
 ): Promise<{ id: string | null; rawUrl: string }> {
-  const sock = await manager.waitForOpen(companyId)
+  const sock = await manager.waitForOpen(companyId, userId)
   const { uploadImageToGitHub } = await import('./github-storage.js')
   const { rawUrl } = await uploadImageToGitHub(image, { path: opts.path || 'whatsapp', fileName: opts.fileName })
   const res = await sock.sendMessage(toJid(to), { image: { url: rawUrl }, caption })
@@ -264,8 +284,8 @@ export async function sendImageFromGitHub(
 }
 
 /** Lista los grupos a los que pertenece la cuenta: { id (JID), name }. */
-export async function listGroups(companyId?: string): Promise<Array<{ id: string; name: string }>> {
-  const sock = await manager.waitForOpen(companyId)
+export async function listGroups(companyId?: string, userId?: string): Promise<Array<{ id: string; name: string }>> {
+  const sock = await manager.waitForOpen(companyId, userId)
   const groups = await sock.groupFetchAllParticipating()
   return Object.values(groups).map((g) => ({ id: g.id, name: g.subject || g.id }))
 }
@@ -274,14 +294,14 @@ export async function listGroups(companyId?: string): Promise<Array<{ id: string
  * Resuelve un enlace/código de invitación de grupo a su JID (y nombre).
  * Acepta la URL completa (https://chat.whatsapp.com/XXXX) o solo el código.
  */
-export async function resolveGroupInvite(linkOrCode: string, companyId?: string): Promise<{ id: string; name: string }> {
-  const sock = await manager.waitForOpen(companyId)
+export async function resolveGroupInvite(linkOrCode: string, companyId?: string, userId?: string): Promise<{ id: string; name: string }> {
+  const sock = await manager.waitForOpen(companyId, userId)
   const code = (linkOrCode || '').trim().replace(/^https?:\/\/chat\.whatsapp\.com\//i, '').replace(/\/+$/, '')
   const meta = await sock.groupGetInviteInfo(code)
   return { id: meta.id, name: meta.subject || meta.id }
 }
 
-/** Cierra la sesión y borra las credenciales de una compañía (fuerza nuevo QR). */
-export async function clearSession(companyId?: string): Promise<void> {
-  return manager.clearSession(companyId)
+/** Cierra la sesión y borra las credenciales de una compañía/usuario (fuerza nuevo QR). */
+export async function clearSession(companyId?: string, userId?: string): Promise<void> {
+  return manager.clearSession(companyId, userId)
 }

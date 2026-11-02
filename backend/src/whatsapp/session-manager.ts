@@ -36,6 +36,10 @@ export type ConnStatus = 'disconnected' | 'connecting' | 'qr' | 'open'
 export interface SessionStatus {
   status: ConnStatus
   hasQr: boolean
+  /** true si hay un código de vinculación (pairing code) pendiente. */
+  hasPairingCode: boolean
+  /** Código de vinculación pendiente, o null. */
+  pairingCode: string | null
   error: string | null
 }
 
@@ -66,6 +70,10 @@ interface State {
   reconnectAttempts: number
   /** true si el usuario cerró sesión a propósito (no auto-reconectar). */
   loggedOut: boolean
+  /** Código de vinculación (pairing code) pendiente, si se solicitó uno. */
+  pairingCode: string | null
+  /** Número (solo dígitos) para el que se solicitó el pairing code. */
+  pairingPhone: string | null
 }
 
 /** Backoff creciente para reconexión (ms): 2s, 5s, 10s, 20s, 30s (tope). */
@@ -82,9 +90,21 @@ export function toJid(input: string): string {
   return `${digits}@s.whatsapp.net`
 }
 
+/**
+ * Normaliza un número de teléfono a solo dígitos, en formato internacional.
+ * Baileys exige el número sin `+`, espacios ni guiones (p. ej. `573001234567`).
+ */
+export function normalizePhoneNumber(input: string): string {
+  return (input || '').replace(/[^\d]/g, '')
+}
+
 export class WhatsAppSessionManager {
   private readonly opts: SessionManagerOptions
-  /** Sesiones por compañía (multi-tenant): clave = companyId (o 'default'). */
+  /**
+   * Sesiones por usuario dentro de la compañía (multi-tenant).
+   * Clave = `companyId::userId` (o solo `companyId` si no hay usuario, o
+   * `'default'` si tampoco hay compañía).
+   */
   private readonly sessions = new Map<string, State>()
 
   constructor(opts: SessionManagerOptions) {
@@ -96,37 +116,115 @@ export class WhatsAppSessionManager {
     return process.env[this.opts.envFlag] === 'true'
   }
 
-  /** Normaliza el companyId a una clave de sesión estable. */
-  private key(companyId?: string): string {
+  /**
+   * Normaliza compañía + usuario a una clave de sesión estable.
+   *
+   * La sesión de WhatsApp se guarda POR USUARIO dentro de la compañía
+   * (`companyId::userId`), de modo que cada persona vincula su propio número.
+   * Si no se indica usuario se conserva la clave por compañía (compatibilidad
+   * con las sesiones ya vinculadas a nivel empresa).
+   */
+  private key(companyId?: string, userId?: string): string {
     const c = (companyId ?? '').trim()
+    const u = (userId ?? '').trim()
+    if (c && u) return `${c}::${u}`
     return c || 'default'
   }
 
-  /** Obtiene (o crea) el State de una compañía. */
-  private state(companyId?: string): State {
-    const key = this.key(companyId)
+  /** Obtiene (o crea) el State de una compañía/usuario. */
+  private state(companyId?: string, userId?: string): State {
+    const key = this.key(companyId, userId)
     let st = this.sessions.get(key)
     if (!st) {
-      st = { sock: null, status: 'disconnected', qrDataUrl: null, lastError: null, starting: false, reconnectAttempts: 0, loggedOut: false }
+      st = { sock: null, status: 'disconnected', qrDataUrl: null, lastError: null, starting: false, reconnectAttempts: 0, loggedOut: false, pairingCode: null, pairingPhone: null }
       this.sessions.set(key, st)
     }
     return st
   }
 
-  getStatus(companyId?: string): SessionStatus {
-    const S = this.state(companyId)
-    return { status: S.status, hasQr: Boolean(S.qrDataUrl), error: S.lastError }
+  getStatus(companyId?: string, userId?: string): SessionStatus {
+    const S = this.state(companyId, userId)
+    return {
+      status: S.status,
+      hasQr: Boolean(S.qrDataUrl),
+      hasPairingCode: Boolean(S.pairingCode),
+      pairingCode: S.pairingCode,
+      error: S.lastError,
+    }
   }
 
-  getQrDataUrl(companyId?: string): string | null {
-    return this.state(companyId).qrDataUrl
+  getQrDataUrl(companyId?: string, userId?: string): string | null {
+    return this.state(companyId, userId).qrDataUrl
   }
 
-  /** Inicia (o reutiliza) la conexión con WhatsApp Web para una compañía. Idempotente. */
-  async start(companyId?: string): Promise<void> {
+  /** Código de vinculación pendiente de una compañía/usuario (o null). */
+  getPairingCode(companyId?: string, userId?: string): string | null {
+    return this.state(companyId, userId).pairingCode
+  }
+
+  /**
+   * Solicita un código de vinculación (pairing code) para un número de teléfono.
+   *
+   * Es la alternativa al QR: el código (alfanumérico, p. ej. `ABCD-1234`) se
+   * ingresa en el teléfono desde WhatsApp → Dispositivos vinculados → Vincular
+   * con número de teléfono. El `phoneNumber` debe venir en formato internacional
+   * y solo dígitos (p. ej. `573001234567`); aquí se normaliza por si acaso.
+   */
+  async requestPairingCode(
+    companyId: string | undefined,
+    userId: string | undefined,
+    phoneNumber: string,
+    customCode?: string,
+  ): Promise<string> {
     if (!this.isEnabled()) throw new Error(this.opts.disabledMessage)
-    const key = this.key(companyId)
-    const S = this.state(companyId)
+    const phone = normalizePhoneNumber(phoneNumber)
+    if (phone.length < 8) {
+      throw new Error('Número de teléfono inválido. Usa el formato internacional sin "+" (p. ej. 573001234567).')
+    }
+
+    const S = this.state(companyId, userId)
+    if (S.status === 'open') {
+      throw new Error('Esta sesión ya está vinculada. Desvincúlala antes de generar un nuevo código.')
+    }
+
+    // Baileys exige un socket creado (aún sin vincular) para pedir el código.
+    // `start` es idempotente: reutiliza el socket si ya se había iniciado.
+    if (!S.sock) await this.start(companyId, userId)
+    const sock = S.sock
+    if (!sock) throw new Error('No se pudo iniciar la conexión con WhatsApp. Reintenta en unos segundos.')
+
+    // `requestPairingCode` envía un nodo por el WebSocket; si el WS aún no está
+    // abierto, Baileys lanza "Connection Closed". Esperamos a que el socket esté
+    // listo (señal: ya emitió el QR, es decir, el WS está abierto) antes de pedir
+    // el código. Si se abre del todo, la sesión ya estaba vinculada.
+    const start = Date.now()
+    while (Date.now() - start < 20_000) {
+      // Relee el estado real en cada vuelta (el socket puede abrirse durante la
+      // espera); así refleja cambios ocurridos fuera de este flujo.
+      const status = this.state(companyId, userId).status
+      if (status === 'open') {
+        throw new Error('Esta sesión ya está vinculada. Desvincúlala antes de generar un nuevo código.')
+      }
+      if (status === 'qr') break
+      if (!S.sock) throw new Error('La conexión con WhatsApp se cerró. Reintenta.')
+      await new Promise((r) => setTimeout(r, 300))
+    }
+    if (S.status !== 'qr') {
+      throw new Error('WhatsApp no respondió a tiempo. Reintenta en unos segundos.')
+    }
+
+    const code = await sock.requestPairingCode(phone, customCode)
+    S.pairingCode = code
+    S.pairingPhone = phone
+    S.lastError = null
+    return code
+  }
+
+  /** Inicia (o reutiliza) la conexión con WhatsApp Web para una compañía/usuario. Idempotente. */
+  async start(companyId?: string, userId?: string): Promise<void> {
+    if (!this.isEnabled()) throw new Error(this.opts.disabledMessage)
+    const key = this.key(companyId, userId)
+    const S = this.state(companyId, userId)
     if (S.sock && (S.status === 'open' || S.status === 'connecting' || S.status === 'qr')) return
     if (S.starting) return
     S.starting = true
@@ -165,6 +263,9 @@ export class WhatsAppSessionManager {
         if (connection === 'open') {
           S.status = 'open'
           S.qrDataUrl = null
+          // El código de vinculación ya se usó (o dejó de ser necesario): limpiar.
+          S.pairingCode = null
+          S.pairingPhone = null
           S.lastError = null
           S.reconnectAttempts = 0 // reconexión exitosa → reinicia el backoff
         }
@@ -210,7 +311,7 @@ export class WhatsAppSessionManager {
         for (const m of messages) {
           if (m.key.fromMe) continue
           try {
-            await this.opts.persistInbound(m, key === 'default' ? null : key)
+            await this.opts.persistInbound(m, key === 'default' ? null : key.split('::')[0])
           } catch { /* db opcional */ }
         }
       })
@@ -251,8 +352,8 @@ export class WhatsAppSessionManager {
   }
 
   /** Devuelve el socket abierto o lanza un error claro si no lo está. */
-  ensureOpen(companyId?: string): WASocket {
-    const S = this.state(companyId)
+  ensureOpen(companyId?: string, userId?: string): WASocket {
+    const S = this.state(companyId, userId)
     if (!S.sock || S.status !== 'open') {
       throw new Error(this.opts.notConnectedMessage)
     }
@@ -264,17 +365,17 @@ export class WhatsAppSessionManager {
    * (tiene credenciales), intenta arrancarla. Así un envío disparado justo cuando
    * la sesión está reconectando no falla de inmediato: le da margen a recuperarse.
    */
-  async waitForOpen(companyId?: string, timeoutMs = 12_000): Promise<WASocket> {
-    const S = this.state(companyId)
+  async waitForOpen(companyId?: string, userId?: string, timeoutMs = 12_000): Promise<WASocket> {
+    const S = this.state(companyId, userId)
     if (S.sock && S.status === 'open') return S.sock
     // Si no hay socket y el usuario no cerró sesión, intenta (re)conectar.
-    if (!S.sock && !S.loggedOut && !S.starting) { void this.start(this.key(companyId)) }
+    if (!S.sock && !S.loggedOut && !S.starting) { void this.start(companyId, userId) }
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
       if (S.sock && S.status === 'open') return S.sock
       await new Promise((r) => setTimeout(r, 500))
     }
-    return this.ensureOpen(companyId) // lanza el error claro si sigue sin conectar
+    return this.ensureOpen(companyId, userId) // lanza el error claro si sigue sin conectar
   }
 
   /**
@@ -284,12 +385,13 @@ export class WhatsAppSessionManager {
    */
   async sendContent<T>(
     companyId: string | undefined,
+    userId: string | undefined,
     to: string,
     content: Record<string, unknown>,
     options: Record<string, unknown> = {},
     retries = 2,
   ): Promise<T> {
-    const sock = await this.waitForOpen(companyId)
+    const sock = await this.waitForOpen(companyId, userId)
     const jid = toJid(to)
 
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -306,14 +408,16 @@ export class WhatsAppSessionManager {
     throw new Error('Fallo al enviar tras reintentos')
   }
 
-  /** Cierra la sesión y borra las credenciales de una compañía (fuerza nuevo QR). */
-  async clearSession(companyId?: string): Promise<void> {
-    const key = this.key(companyId)
-    const S = this.state(key)
+  /** Cierra la sesión y borra las credenciales de una compañía/usuario (fuerza nuevo QR). */
+  async clearSession(companyId?: string, userId?: string): Promise<void> {
+    const key = this.key(companyId, userId)
+    const S = this.state(companyId, userId)
     try { await S.sock?.logout() } catch { /* noop */ }
     S.sock = null
     S.status = 'disconnected'
     S.qrDataUrl = null
+    S.pairingCode = null
+    S.pairingPhone = null
     S.lastError = null
     try {
       const { clear } = await useMongoAuthState(this.opts.domain, this.opts.authCollection, key)

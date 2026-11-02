@@ -97,6 +97,7 @@ export async function sendTemplate(
   phone: string,
   vars: TemplateVars,
   overrideTemplate?: string,
+  userId?: string,
 ): Promise<SendTemplateResult> {
   const cfg = await getMessageConfig(companyId, tipo)
 
@@ -115,23 +116,23 @@ export async function sendTemplate(
     if (cfg.options.length <= 3) {
       const buttons = cfg.options.map((o) => ({ id: `${tipo}:${o.id}`, text: o.label }))
       try {
-        const result = await sendButtonsMessage(to, baseText, buttons, companyId)
+        const result = await sendButtonsMessage(to, baseText, buttons, companyId, userId)
         return { sent: true, id: result.id, text: baseText }
       } catch {
         // Fallback: si por algún motivo falla el envío nativo, anexa las
         // opciones como lista numerada para no perder la posibilidad de respuesta.
         const numbered = cfg.options.map((o, i) => `${i + 1}️⃣ ${o.label}`).join('\n')
         const text = `${baseText}\n\n————————————\n👉 *Responde con el número de tu elección:*\n${numbered}`
-        const result = await sendText(to, text, companyId)
+        const result = await sendText(to, text, companyId, userId)
         return { sent: true, id: result.id, text }
       }
     }
     // Más de 3 → lista desplegable nativa.
     const rows = cfg.options.map((o) => ({ id: `${tipo}:${o.id}`, title: o.label }))
-    const result = await sendListMessage(to, baseText, 'Responder', rows, companyId)
+    const result = await sendListMessage(to, baseText, 'Responder', rows, companyId, userId)
     return { sent: true, id: result.id, text: baseText }
   }
 
-  const result = await sendText(to, baseText, companyId)
+  const result = await sendText(to, baseText, companyId, userId)
   return { sent: true, id: result.id, text: baseText }
 }

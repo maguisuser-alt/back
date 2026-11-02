@@ -9,6 +9,7 @@
  *  - GET  /api/whatsapp-turnos/status  → estado de conexión
  *  - GET  /api/whatsapp-turnos/qr      → QR (image/png o data URL)
  *  - POST /api/whatsapp-turnos/start   → inicia la conexión
+ *  - POST /api/whatsapp-turnos/pairing-code → genera código de vinculación por número
  *  - POST /api/whatsapp-turnos/logout  → cierra sesión y borra credenciales
  *  - POST /api/whatsapp-turnos/send-text    → envía texto a un número/grupo
  *  - POST /api/whatsapp-turnos/send-list    → envía mensaje de opción múltiple (lista)
@@ -17,7 +18,7 @@
 
 import { Router } from 'express'
 import {
-  startWhatsAppTurnos, getStatus, getQrDataUrl, sendText, sendListMessage,
+  startWhatsAppTurnos, getStatus, getQrDataUrl, requestPairingCode, sendText, sendListMessage,
   sendButtonsMessage, sendImage, sendAlbum, sendDocument, sendAudio,
   listGroups, clearSession, toJid,
 } from '../lib/whatsapp-turnos.js'
@@ -49,16 +50,27 @@ export const whatsappTurnosRouter = Router()
 
 const VALID_TEMPLATES: TemplateKey[] = ['turno_confirmacion', 'turno_recordatorio', 'clase_recordatorio']
 
+/**
+ * Usuario dueño de la sesión de WhatsApp. La vinculación es POR USUARIO dentro
+ * de la compañía, así que el `userId` viaja en body o query (los frontends lo
+ * envían desde la sesión activa). Si no viene, se conserva la sesión a nivel
+ * compañía (compatibilidad).
+ */
+function reqUserId(req: { body?: any; query?: any }): string | undefined {
+  return (req.body?.userId as string) || (req.query.userId as string) || undefined
+}
+
 whatsappTurnosRouter.get('/status', (req, res) => {
   const companyId = (req.query.companyId as string) || undefined
-  res.json(getStatus(companyId))
+  res.json(getStatus(companyId, reqUserId(req)))
 })
 
 whatsappTurnosRouter.post('/start', async (req, res) => {
   const companyId = (req.body?.companyId as string) || (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   try {
-    await startWhatsAppTurnos(companyId)
-    res.json(getStatus(companyId))
+    await startWhatsAppTurnos(companyId, userId)
+    res.json(getStatus(companyId, userId))
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo iniciar WhatsApp de Turnos.' })
   }
@@ -66,17 +78,18 @@ whatsappTurnosRouter.post('/start', async (req, res) => {
 
 whatsappTurnosRouter.get('/qr', async (req, res) => {
   const companyId = (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   try {
-    const st = getStatus(companyId)
-    if (st.status === 'disconnected') await startWhatsAppTurnos(companyId)
+    const st = getStatus(companyId, userId)
+    if (st.status === 'disconnected') await startWhatsAppTurnos(companyId, userId)
 
-    const dataUrl = getQrDataUrl(companyId)
+    const dataUrl = getQrDataUrl(companyId, userId)
     if (!dataUrl) {
-      res.status(202).json({ message: 'QR aún no disponible. Reintenta en 1-2 segundos.', status: getStatus(companyId).status })
+      res.status(202).json({ message: 'QR aún no disponible. Reintenta en 1-2 segundos.', status: getStatus(companyId, userId).status })
       return
     }
     if ((req.query.format as string) === 'json') {
-      res.json({ qr: dataUrl, status: getStatus(companyId).status })
+      res.json({ qr: dataUrl, status: getStatus(companyId, userId).status })
       return
     }
     const base64 = dataUrl.split(',')[1]
@@ -87,13 +100,32 @@ whatsappTurnosRouter.get('/qr', async (req, res) => {
   }
 })
 
+/**
+ * Genera un código de vinculación (pairing code) para vincular por número.
+ * Alternativa al QR: el código se ingresa en el teléfono desde
+ * WhatsApp → Dispositivos vinculados → Vincular con número de teléfono.
+ */
+whatsappTurnosRouter.post('/pairing-code', async (req, res) => {
+  const companyId = (req.body?.companyId as string) || (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
+  const phoneNumber = (req.body?.phoneNumber as string) || ''
+  if (!phoneNumber) { res.status(400).json({ message: 'Debes enviar "phoneNumber" en formato internacional (p. ej. 573001234567).' }); return }
+  try {
+    const code = await requestPairingCode(companyId, userId, phoneNumber)
+    res.json({ pairingCode: code, status: getStatus(companyId, userId).status })
+  } catch (err) {
+    res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo generar el código de vinculación.' })
+  }
+})
+
 whatsappTurnosRouter.post('/send-text', async (req, res) => {
   const { to, text, companyId } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido (número o JID de grupo).' }); return }
   if (!text) { res.status(400).json({ message: 'Debes enviar "text".' }); return }
 
   try {
-    const result = await sendText(to, text, companyId)
+    const result = await sendText(to, text, companyId, userId)
     res.json({ message: 'Mensaje enviado.', id: result.id })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el mensaje.' })
@@ -102,13 +134,14 @@ whatsappTurnosRouter.post('/send-text', async (req, res) => {
 
 whatsappTurnosRouter.post('/send-image', async (req, res) => {
   const { to, imageUrl, base64, caption, companyId } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido.' }); return }
   if (!imageUrl && !base64) { res.status(400).json({ message: 'Debes enviar "imageUrl" o "base64".' }); return }
   try {
     const image: Buffer | string = base64
       ? Buffer.from(base64, 'base64')
       : imageUrl
-    const result = await sendImage(to, image, caption, companyId)
+    const result = await sendImage(to, image, caption, companyId, userId)
     res.json({ message: 'Imagen enviada.', id: result.id })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar la imagen.' })
@@ -117,6 +150,7 @@ whatsappTurnosRouter.post('/send-image', async (req, res) => {
 
 whatsappTurnosRouter.post('/send-album', async (req, res) => {
   const { to, images, caption, companyId } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido.' }); return }
   if (!Array.isArray(images) || images.length === 0) {
     res.status(400).json({ message: 'Debes enviar "images" (array).' }); return
@@ -126,7 +160,7 @@ whatsappTurnosRouter.post('/send-album', async (req, res) => {
       image: it.base64 ? Buffer.from(it.base64, 'base64') : it.imageUrl,
       caption: it.caption,
     }))
-    const result = await sendAlbum(to, items, caption, companyId)
+    const result = await sendAlbum(to, items, caption, companyId, userId)
     res.json({ message: `Álbum enviado (${result.count} foto(s)).`, id: result.id, count: result.count })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el álbum.' })
@@ -135,11 +169,12 @@ whatsappTurnosRouter.post('/send-album', async (req, res) => {
 
 whatsappTurnosRouter.post('/send-document', async (req, res) => {
   const { to, documentUrl, base64, fileName, caption, mimetype, companyId } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido.' }); return }
   if (!documentUrl && !base64) { res.status(400).json({ message: 'Debes enviar "documentUrl" o "base64".' }); return }
   try {
     const document: Buffer | string = base64 ? Buffer.from(base64, 'base64') : documentUrl
-    const result = await sendDocument(to, document, fileName ?? 'archivo', caption, companyId, mimetype)
+    const result = await sendDocument(to, document, fileName ?? 'archivo', caption, companyId, mimetype, userId)
     res.json({ message: 'Documento enviado.', id: result.id })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el documento.' })
@@ -148,11 +183,12 @@ whatsappTurnosRouter.post('/send-document', async (req, res) => {
 
 whatsappTurnosRouter.post('/send-audio', async (req, res) => {
   const { to, audioUrl, base64, mimetype, companyId } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido.' }); return }
   if (!audioUrl && !base64) { res.status(400).json({ message: 'Debes enviar "audioUrl" o "base64".' }); return }
   try {
     const audio: Buffer | string = base64 ? Buffer.from(base64, 'base64') : audioUrl
-    const result = await sendAudio(to, audio, companyId, mimetype)
+    const result = await sendAudio(to, audio, companyId, mimetype, userId)
     res.json({ message: 'Audio enviado.', id: result.id })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el audio.' })
@@ -161,13 +197,14 @@ whatsappTurnosRouter.post('/send-audio', async (req, res) => {
 
 whatsappTurnosRouter.post('/send-list', async (req, res) => {
   const { to, title, buttonText, rows, companyId } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido.' }); return }
   if (!rows || !Array.isArray(rows) || rows.length === 0) {
     res.status(400).json({ message: 'Debes enviar "rows" (array de opciones).' }); return
   }
 
   try {
-    const result = await sendListMessage(to, title ?? '', buttonText ?? 'Seleccionar', rows, companyId)
+    const result = await sendListMessage(to, title ?? '', buttonText ?? 'Seleccionar', rows, companyId, userId)
     res.json({ message: 'Mensaje de opción múltiple enviado.', id: result.id })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el mensaje de opción múltiple.' })
@@ -176,13 +213,14 @@ whatsappTurnosRouter.post('/send-list', async (req, res) => {
 
 whatsappTurnosRouter.post('/send-buttons', async (req, res) => {
   const { to, text, buttons, companyId } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido.' }); return }
   if (!buttons || !Array.isArray(buttons) || buttons.length === 0) {
     res.status(400).json({ message: 'Debes enviar "buttons" (array de botones).' }); return
   }
 
   try {
-    const result = await sendButtonsMessage(to, text ?? '', buttons, companyId)
+    const result = await sendButtonsMessage(to, text ?? '', buttons, companyId, userId)
     res.json({ message: 'Mensaje con botones enviado.', id: result.id })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el mensaje con botones.' })
@@ -199,6 +237,7 @@ whatsappTurnosRouter.post('/send-buttons', async (req, res) => {
  */
 whatsappTurnosRouter.post('/send-template', async (req, res) => {
   const { companyId, tipo, to, vars } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
   if (!tipo || !VALID_TEMPLATES.includes(tipo)) {
     res.status(400).json({ message: 'tipo inválido. Usa turno_confirmacion, turno_recordatorio o clase_recordatorio.' }); return
@@ -206,7 +245,7 @@ whatsappTurnosRouter.post('/send-template', async (req, res) => {
   if (!to) { res.status(400).json({ message: 'El destino "to" (teléfono) es requerido.' }); return }
 
   try {
-    const result = await sendTemplate(companyId, tipo as TemplateKey, String(to), (vars ?? {}) as TemplateVars)
+    const result = await sendTemplate(companyId, tipo as TemplateKey, String(to), (vars ?? {}) as TemplateVars, undefined, userId)
     if (!result.sent) { res.status(409).json({ message: result.reason ?? 'No se pudo enviar.' }); return }
     res.json({ message: 'Mensaje enviado.', id: result.id, text: result.text })
   } catch (err) {
@@ -263,6 +302,7 @@ whatsappTurnosRouter.get('/turn-template', async (req, res) => {
  */
 whatsappTurnosRouter.post('/send-turn-confirmation', async (req, res) => {
   const { turnId, to, message } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!turnId) { res.status(400).json({ message: 'turnId es requerido.' }); return }
 
   try {
@@ -281,7 +321,7 @@ whatsappTurnosRouter.post('/send-turn-confirmation', async (req, res) => {
     const location = turn.locationId ? db.locations.find((l) => l.id === turn.locationId) : undefined
     const vars = buildTurnVars(turn, worker, location)
     const override = typeof message === 'string' && message.trim() ? message : undefined
-    const result = await sendTemplate(turn.companyId, 'turno_confirmacion', destino, vars, override)
+    const result = await sendTemplate(turn.companyId, 'turno_confirmacion', destino, vars, override, userId)
     if (!result.sent) { res.status(409).json({ message: result.reason ?? 'No se pudo enviar.' }); return }
     res.json({ message: 'Confirmación de turno enviada.', id: result.id, text: result.text })
   } catch (err) {
@@ -298,6 +338,7 @@ whatsappTurnosRouter.post('/send-turn-confirmation', async (req, res) => {
  */
 whatsappTurnosRouter.post('/send-invitation', async (req, res) => {
   const { companyId, to, nombre, url, invitePath } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
   if (!to) { res.status(400).json({ message: 'El destino "to" (teléfono) es requerido.' }); return }
   const link = url ?? invitePath
@@ -311,7 +352,7 @@ whatsappTurnosRouter.post('/send-invitation', async (req, res) => {
   const text = `${saludo}te han invitado a registrarte en Ommex. Completa tu registro aquí:\n${link}`
 
   try {
-    const result = await sendText(dest, text, String(companyId))
+    const result = await sendText(dest, text, String(companyId), userId)
     res.json({ message: 'Invitación enviada.', id: result.id, text })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar la invitación.' })
@@ -325,7 +366,7 @@ whatsappTurnosRouter.post('/send-invitation', async (req, res) => {
 whatsappTurnosRouter.get('/groups', async (req, res) => {
   const companyId = (req.query.companyId as string) || undefined
   try {
-    const groups = await listGroups(companyId)
+    const groups = await listGroups(companyId, reqUserId(req))
     res.json({ groups })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudieron listar los grupos.' })
@@ -334,8 +375,9 @@ whatsappTurnosRouter.get('/groups', async (req, res) => {
 
 whatsappTurnosRouter.post('/logout', async (req, res) => {
   const companyId = (req.body?.companyId as string) || (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   try {
-    await clearSession(companyId)
+    await clearSession(companyId, userId)
     res.json({ message: 'Sesión cerrada. Escanea el QR para volver a conectar.' })
   } catch (err) {
     res.status(500).json({ message: err instanceof Error ? err.message : 'No se pudo cerrar la sesión.' })

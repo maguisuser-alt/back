@@ -7,6 +7,7 @@
  *  - GET  /api/whatsapp-web/status  → estado de conexión
  *  - GET  /api/whatsapp-web/qr      → QR (image/png) para escanear
  *  - POST /api/whatsapp-web/start   → inicia la conexión
+ *  - POST /api/whatsapp-web/pairing-code → genera código de vinculación por número
  *  - POST /api/whatsapp-web/send    → envía texto o imagen a número o grupo
  *  - POST /api/whatsapp-web/logout  → cierra sesión y borra credenciales
  */
@@ -14,7 +15,7 @@
 import { Router } from 'express'
 import { getDb } from '../lib/mongodb.js'
 import {
-  startWhatsAppWeb, getStatus, getQrDataUrl, sendText, sendImage, sendAlbum, sendImageFromGitHub,
+  startWhatsAppWeb, getStatus, getQrDataUrl, requestPairingCode, sendText, sendImage, sendAlbum, sendImageFromGitHub,
   listGroups, resolveGroupInvite, clearSession, toJid, sendAudio, sendDocument,
 } from '../lib/whatsapp-web.js'
 import { isGitHubConfigured } from '../lib/github-storage.js'
@@ -23,6 +24,16 @@ import { shouldForwardToTurnos } from '../lib/turnos-link.js'
 export const whatsappWebRouter = Router()
 
 const COLLECTION = 'whatsapp_messages'
+
+/**
+ * Usuario dueño de la sesión de WhatsApp. La vinculación es POR USUARIO dentro
+ * de la compañía: se toma del usuario autenticado (`req.session.user`, inyectado
+ * por requireToken) y, si el cliente envía `userId` explícito, este tiene
+ * prioridad. Sin usuario se conserva la sesión a nivel compañía.
+ */
+function reqUserId(req: { body?: any; query?: any; session?: { user?: string } }): string | undefined {
+  return (req.body?.userId as string) || (req.query?.userId as string) || req.session?.user || undefined
+}
 
 const TURNOS_API_URL = (process.env.TURNOS_API_URL || '').replace(/\/$/, '')
 
@@ -89,45 +100,46 @@ export async function isTurnosLinked(companyId?: string): Promise<boolean> {
 
 export function resetUnifiedCache() { unifiedCache = {} }
 
-async function uSendText(to: string, text: string, companyId?: string): Promise<{ id: string | null }> {
+async function uSendText(to: string, text: string, companyId?: string, userId?: string): Promise<{ id: string | null }> {
   if (await isUnified(companyId)) {
-    const r = await forwardToTurnos('/send-text', 'POST', { to, text, companyId })
+    const r = await forwardToTurnos('/send-text', 'POST', { to, text, companyId, userId })
     if (r.status >= 400) throw new Error(r.data?.message || `Error ${r.status}`)
     return { id: r.data?.id ?? null }
   }
-  return sendText(to, text, companyId)
+  return sendText(to, text, companyId, userId)
 }
 
-async function uSendImage(to: string, imageUrl: string, caption?: string, companyId?: string): Promise<{ id: string | null }> {
+async function uSendImage(to: string, imageUrl: string, caption?: string, companyId?: string, userId?: string): Promise<{ id: string | null }> {
   if (await isUnified(companyId)) {
-    const r = await forwardToTurnos('/send-image', 'POST', { to, imageUrl, caption, companyId })
+    const r = await forwardToTurnos('/send-image', 'POST', { to, imageUrl, caption, companyId, userId })
     if (r.status >= 400) throw new Error(r.data?.message || `Error ${r.status}`)
     return { id: r.data?.id ?? null }
   }
-  return sendImage(to, imageUrl, caption, companyId)
+  return sendImage(to, imageUrl, caption, companyId, userId)
 }
 
-async function uSendAlbum(to: string, urls: string[], caption?: string, companyId?: string): Promise<{ id: string | null; count: number }> {
+async function uSendAlbum(to: string, urls: string[], caption?: string, companyId?: string, userId?: string): Promise<{ id: string | null; count: number }> {
   if (await isUnified(companyId)) {
     const r = await forwardToTurnos('/send-album', 'POST', {
       to,
       images: urls.map((imageUrl) => ({ imageUrl })),
       caption,
       companyId,
+      userId,
     })
     if (r.status >= 400) throw new Error(r.data?.message || `Error ${r.status}`)
     return { id: r.data?.id ?? null, count: r.data?.count ?? urls.length }
   }
-  return sendAlbum(to, urls, caption, companyId)
+  return sendAlbum(to, urls, caption, companyId, userId)
 }
 
-async function uSendAudio(to: string, audioUrl: string, companyId?: string, mimetype?: string): Promise<{ id: string | null }> {
+async function uSendAudio(to: string, audioUrl: string, companyId?: string, mimetype?: string, userId?: string): Promise<{ id: string | null }> {
   if (await isUnified(companyId)) {
-    const r = await forwardToTurnos('/send-audio', 'POST', { to, audioUrl, mimetype, companyId })
+    const r = await forwardToTurnos('/send-audio', 'POST', { to, audioUrl, mimetype, companyId, userId })
     if (r.status >= 400) throw new Error(r.data?.message || `Error ${r.status}`)
     return { id: r.data?.id ?? null }
   }
-  return sendAudio(to, audioUrl, companyId, mimetype)
+  return sendAudio(to, audioUrl, companyId, mimetype, userId)
 }
 
 async function uSendDocument(
@@ -135,6 +147,7 @@ async function uSendDocument(
   docUrl: string,
   opts: { fileName?: string; caption?: string; mimetype?: string } = {},
   companyId?: string,
+  userId?: string,
 ): Promise<{ id: string | null }> {
   if (await isUnified(companyId)) {
     const r = await forwardToTurnos('/send-document', 'POST', {
@@ -144,32 +157,35 @@ async function uSendDocument(
       caption: opts.caption,
       mimetype: opts.mimetype,
       companyId,
+      userId,
     })
     if (r.status >= 400) throw new Error(r.data?.message || `Error ${r.status}`)
     return { id: r.data?.id ?? null }
   }
-  return sendDocument(to, docUrl, opts, companyId)
+  return sendDocument(to, docUrl, opts, companyId, userId)
 }
 
 whatsappWebRouter.get('/status', async (req, res) => {
   const companyId = (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   if (await isUnifiedMode(companyId)) {
-    const r = await forwardToTurnos('/status', 'GET', undefined, companyId ? { companyId } : undefined)
+    const r = await forwardToTurnos('/status', 'GET', undefined, companyId ? { companyId, userId } : undefined)
     return res.status(r.status).json(r.data)
   }
-  res.json(getStatus(companyId))
+  res.json(getStatus(companyId, userId))
 })
 
 /** Inicia la conexión (si no está activa) y devuelve el estado. */
 whatsappWebRouter.post('/start', async (req, res) => {
   const companyId = (req.body?.companyId as string) || (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   if (await isUnifiedMode(companyId)) {
-    const r = await forwardToTurnos('/start', 'POST', { companyId })
+    const r = await forwardToTurnos('/start', 'POST', { companyId, userId })
     return res.status(r.status).json(r.data)
   }
   try {
-    await startWhatsAppWeb(companyId)
-    res.json(getStatus(companyId))
+    await startWhatsAppWeb(companyId, userId)
+    res.json(getStatus(companyId, userId))
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo iniciar WhatsApp Web.' })
   }
@@ -181,21 +197,22 @@ whatsappWebRouter.post('/start', async (req, res) => {
  */
 whatsappWebRouter.get('/qr', async (req, res) => {
   const companyId = (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   if (await isUnifiedMode(companyId)) {
-    const r = await forwardToTurnos('/qr', 'GET', undefined, { companyId, format: req.query.format as string | undefined })
+    const r = await forwardToTurnos('/qr', 'GET', undefined, { companyId, userId, format: req.query.format as string | undefined })
     return res.status(r.status).json(r.data)
   }
   try {
-    const st = getStatus(companyId)
-    if (st.status === 'disconnected') await startWhatsAppWeb(companyId)
+    const st = getStatus(companyId, userId)
+    if (st.status === 'disconnected') await startWhatsAppWeb(companyId, userId)
 
-    const dataUrl = getQrDataUrl(companyId)
+    const dataUrl = getQrDataUrl(companyId, userId)
     if (!dataUrl) {
-      res.status(202).json({ message: 'QR aún no disponible. Reintenta en 1-2 segundos.', status: getStatus(companyId).status })
+      res.status(202).json({ message: 'QR aún no disponible. Reintenta en 1-2 segundos.', status: getStatus(companyId, userId).status })
       return
     }
     if ((req.query.format as string) === 'json') {
-      res.json({ qr: dataUrl, status: getStatus(companyId).status })
+      res.json({ qr: dataUrl, status: getStatus(companyId, userId).status })
       return
     }
     const base64 = dataUrl.split(',')[1]
@@ -207,20 +224,43 @@ whatsappWebRouter.get('/qr', async (req, res) => {
 })
 
 /**
+ * Genera un código de vinculación (pairing code) para vincular por número.
+ * Alternativa al QR: el código se ingresa en el teléfono desde
+ * WhatsApp → Dispositivos vinculados → Vincular con número de teléfono.
+ */
+whatsappWebRouter.post('/pairing-code', async (req, res) => {
+  const companyId = (req.body?.companyId as string) || (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
+  const phoneNumber = (req.body?.phoneNumber as string) || ''
+  if (!phoneNumber) { res.status(400).json({ message: 'Debes enviar "phoneNumber" en formato internacional (p. ej. 573001234567).' }); return }
+  if (await isUnifiedMode(companyId)) {
+    const r = await forwardToTurnos('/pairing-code', 'POST', { phoneNumber, companyId, userId })
+    return res.status(r.status).json(r.data)
+  }
+  try {
+    const code = await requestPairingCode(companyId, userId, phoneNumber)
+    res.json({ pairingCode: code, status: getStatus(companyId, userId).status })
+  } catch (err) {
+    res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo generar el código de vinculación.' })
+  }
+})
+
+/**
  * Envía un mensaje.
  * Body: { to, text?, imageUrl?, caption?, companyId?, trackingCode? }
  * `to` puede ser un número (+57...) o un JID de grupo (xxxxx@g.us).
  */
 whatsappWebRouter.post('/send', async (req, res) => {
   const { to, text, imageUrl, caption, companyId, trackingCode } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido (número o JID de grupo).' }); return }
   if (!text && !imageUrl) { res.status(400).json({ message: 'Debes enviar "text" o "imageUrl".' }); return }
 
   if (await isUnifiedMode(companyId)) {
     const path = imageUrl ? '/send-image' : '/send-text'
     const body = imageUrl
-      ? { to, imageUrl, caption, companyId }
-      : { to, text, companyId }
+      ? { to, imageUrl, caption, companyId, userId }
+      : { to, text, companyId, userId }
     const r = await forwardToTurnos(path, 'POST', body)
     if (r.status >= 200 && r.status < 300) {
       try {
@@ -237,8 +277,8 @@ whatsappWebRouter.post('/send', async (req, res) => {
 
   try {
     const result = imageUrl
-      ? await sendImage(to, imageUrl, caption, companyId)
-      : await sendText(to, text, companyId)
+      ? await sendImage(to, imageUrl, caption, companyId, userId)
+      : await sendText(to, text, companyId, userId)
 
     try {
       await getDb().collection(COLLECTION).insertOne({
@@ -267,12 +307,13 @@ whatsappWebRouter.post('/send', async (req, res) => {
  */
 whatsappWebRouter.post('/send-github', async (req, res) => {
   const { to, base64, caption, path, fileName, companyId, trackingCode } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido (número o JID de grupo).' }); return }
   if (!base64) { res.status(400).json({ message: '"base64" (imagen) es requerido.' }); return }
   if (!isGitHubConfigured()) { res.status(502).json({ message: 'GitHub no está configurado en el servidor (GITHUB_TOKEN/OWNER/REPO).' }); return }
 
   try {
-    const result = await sendImageFromGitHub(to, base64, caption, { path, fileName }, companyId)
+    const result = await sendImageFromGitHub(to, base64, caption, { path, fileName }, companyId, userId)
     try {
       await getDb().collection(COLLECTION).insertOne({
         direction: 'outbound',
@@ -303,6 +344,7 @@ whatsappWebRouter.post('/send-github', async (req, res) => {
  */
 whatsappWebRouter.post('/send-operation', async (req, res) => {
   const { trackingCode, to: toOverride, headerFields, headerOnly } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!trackingCode) { res.status(400).json({ message: 'trackingCode es requerido.' }); return }
   // Campos de cabecera a incluir en el mensaje de encabezado. Si no se envía,
   // se incluyen todos (compatibilidad). Valores: 'tipo','placa','operador','fecha'.
@@ -362,7 +404,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
     // Fallback: si se deseleccionaron todos los campos, incluye al menos el
     // operador para que el encabezado no quede solo con el código.
     if (headerLines.length === 1) headerLines.push(`👤 ${op.operatorName}`)
-    await uSendText(to, headerLines.join('\n'), companyId); sent++
+    await uSendText(to, headerLines.join('\n'), companyId, userId); sent++
     await delay(PAUSE)
 
     // Si solo se pidió el encabezado, termina aquí (matriz mensaje×chat).
@@ -382,7 +424,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
         // Mensaje escrito del registro (nota de solo texto).
         const hora = item.timestamp ? fmt(item.timestamp) : ''
         const txt = hora ? `📝 ${item.comment}\n🕒 ${hora}` : `📝 ${item.comment}`
-        await uSendText(to, txt, companyId)
+        await uSendText(to, txt, companyId, userId)
         sent++
         await delay(PAUSE)
         i++
@@ -391,7 +433,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
 
       // Audio: enviar como nota de voz, no como imagen.
       if (item.mediaType === 'audio' && hasUrl(item)) {
-        try { await uSendAudio(to, item.driveUrl as string, companyId, item.mimeType) ; sent++ } catch { /* continúa */ }
+        try { await uSendAudio(to, item.driveUrl as string, companyId, item.mimeType, userId) ; sent++ } catch { /* continúa */ }
         await delay(PAUSE)
         i++
         continue
@@ -400,7 +442,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
       // Documento: enviar como archivo, no como imagen.
       if (item.mediaType === 'document' && hasUrl(item)) {
         try {
-          await uSendDocument(to, item.driveUrl as string, { fileName: item.fileName, caption: item.comment, mimetype: item.mimeType }, companyId)
+          await uSendDocument(to, item.driveUrl as string, { fileName: item.fileName, caption: item.comment, mimetype: item.mimeType }, companyId, userId)
           sent++
         } catch { /* continúa */ }
         await delay(PAUSE)
@@ -424,14 +466,14 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
         // Caption: el comentario de la primera foto del grupo (si hay).
         const caption = (group[0].comment ?? '').trim() || undefined
         const urls = group.map((p) => p.driveUrl as string)
-        const r = await uSendAlbum(to, urls, caption, companyId)
+        const r = await uSendAlbum(to, urls, caption, companyId, userId)
         sent += r.count
         i += group.length
       } else {
         // Solo el comentario real del usuario; NO el stepName ("Registro
         // fotográfico") que no debe enviarse como texto.
         const cap = (item.comment ?? '').trim() || undefined
-        await uSendImage(to, item.driveUrl as string, cap, companyId)
+        await uSendImage(to, item.driveUrl as string, cap, companyId, userId)
         sent++
         i++
       }
@@ -460,7 +502,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
       const caption = `📦 *${prod.productCode}*${desc}${obs}`
 
       const urls = sendable.map((p) => p.driveUrl as string)
-      const r = await uSendAlbum(to, urls, caption, companyId)
+      const r = await uSendAlbum(to, urls, caption, companyId, userId)
       sent += r.count
       await delay(PAUSE)
     }
@@ -479,6 +521,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
  */
 whatsappWebRouter.post('/send-product', async (req, res) => {
   const { trackingCode, productCode, to: toOverride } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!trackingCode || !productCode) { res.status(400).json({ message: 'trackingCode y productCode son requeridos.' }); return }
 
   try {
@@ -521,7 +564,7 @@ whatsappWebRouter.post('/send-product', async (req, res) => {
     const obs = obsList.length ? `\n📝 ${obsList.join(' · ')}` : ''
     const caption = `📦 *${prod.productCode}*${desc}${obs}`
 
-    const r = await uSendAlbum(to, sendable.map((p) => p.driveUrl as string), caption, companyId)
+    const r = await uSendAlbum(to, sendable.map((p) => p.driveUrl as string), caption, companyId, userId)
     res.json({ message: `Producto ${productCode} enviado (${r.count} foto(s)).`, to, sent: r.count })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar producto:', err)
@@ -536,6 +579,7 @@ whatsappWebRouter.post('/send-product', async (req, res) => {
  */
 whatsappWebRouter.post('/send-photo-group', async (req, res) => {
   const { trackingCode, photoIndices, to: toOverride } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!trackingCode || !Array.isArray(photoIndices) || photoIndices.length === 0) {
     res.status(400).json({ message: 'trackingCode y photoIndices (array) son requeridos.' }); return
   }
@@ -574,7 +618,7 @@ whatsappWebRouter.post('/send-photo-group', async (req, res) => {
     // NO se usa stepName ("Registro fotográfico") como texto del mensaje.
     const withComment = sendable.find((p) => (p.comment ?? '').trim())
     const captionText = (withComment?.comment ?? '').trim() || undefined
-    const r = await uSendAlbum(to, sendable.map((p) => p.driveUrl as string), captionText, companyId)
+    const r = await uSendAlbum(to, sendable.map((p) => p.driveUrl as string), captionText, companyId, userId)
     res.json({ message: `Álbum enviado (${r.count} foto(s)).`, to, sent: r.count })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar álbum:', err)
@@ -589,6 +633,7 @@ whatsappWebRouter.post('/send-photo-group', async (req, res) => {
  */
 whatsappWebRouter.post('/send-photo', async (req, res) => {
   const { trackingCode, photoIndex, to: toOverride } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!trackingCode || photoIndex === undefined || photoIndex === null) {
     res.status(400).json({ message: 'trackingCode y photoIndex son requeridos.' }); return
   }
@@ -623,7 +668,7 @@ whatsappWebRouter.post('/send-photo', async (req, res) => {
     if (isNote || (noImage && !photo.mediaType)) {
       const text = (photo.comment ?? '').trim()
       if (!text) { res.status(400).json({ message: 'La nota no tiene texto para enviar.' }); return }
-      const r = await uSendText(to, text, companyId)
+      const r = await uSendText(to, text, companyId, userId)
       res.json({ message: 'Mensaje enviado a WhatsApp.', to, id: r.id })
       return
     }
@@ -638,13 +683,13 @@ whatsappWebRouter.post('/send-photo', async (req, res) => {
 
     // Audio, documento o imagen — usar el helper adecuado.
     if (photo.mediaType === 'audio') {
-      const r = await uSendAudio(to, url, companyId, photo.mimeType)
+      const r = await uSendAudio(to, url, companyId, photo.mimeType, userId)
       res.json({ message: 'Audio enviado a WhatsApp.', to, id: r.id })
     } else if (photo.mediaType === 'document') {
-      const r = await uSendDocument(to, url, { fileName: photo.fileName, caption, mimetype: photo.mimeType }, companyId)
+      const r = await uSendDocument(to, url, { fileName: photo.fileName, caption, mimetype: photo.mimeType }, companyId, userId)
       res.json({ message: 'Documento enviado a WhatsApp.', to, id: r.id })
     } else {
-      const r = await uSendImage(to, url, caption, companyId)
+      const r = await uSendImage(to, url, caption, companyId, userId)
       res.json({ message: 'Foto enviada a WhatsApp.', to, id: r.id })
     }
   } catch (err) {
@@ -660,6 +705,7 @@ whatsappWebRouter.post('/send-photo', async (req, res) => {
  */
 whatsappWebRouter.post('/send-audio', async (req, res) => {
   const { trackingCode, audioUrl, mimetype, to: toOverride } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!trackingCode) { res.status(400).json({ message: 'trackingCode es requerido.' }); return }
   if (!audioUrl) { res.status(400).json({ message: 'audioUrl es requerido.' }); return }
 
@@ -676,7 +722,7 @@ whatsappWebRouter.post('/send-audio', async (req, res) => {
     }
     if (!to) { res.status(400).json({ message: 'No hay destino de WhatsApp configurado para esta empresa.' }); return }
 
-    const r = await uSendAudio(to, audioUrl, companyId, mimetype)
+    const r = await uSendAudio(to, audioUrl, companyId, mimetype, userId)
     res.json({ message: 'Audio enviado a WhatsApp.', to, id: r.id })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar audio:', err)
@@ -691,6 +737,7 @@ whatsappWebRouter.post('/send-audio', async (req, res) => {
  */
 whatsappWebRouter.post('/send-document', async (req, res) => {
   const { trackingCode, documentUrl, fileName, caption, mimetype, to: toOverride } = req.body ?? {}
+  const userId = reqUserId(req)
   if (!trackingCode) { res.status(400).json({ message: 'trackingCode es requerido.' }); return }
   if (!documentUrl) { res.status(400).json({ message: 'documentUrl es requerido.' }); return }
 
@@ -707,7 +754,7 @@ whatsappWebRouter.post('/send-document', async (req, res) => {
     }
     if (!to) { res.status(400).json({ message: 'No hay destino de WhatsApp configurado para esta empresa.' }); return }
 
-    const r = await uSendDocument(to, documentUrl, { fileName, caption, mimetype }, companyId)
+    const r = await uSendDocument(to, documentUrl, { fileName, caption, mimetype }, companyId, userId)
     res.json({ message: 'Documento enviado a WhatsApp.', to, id: r.id })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar documento:', err)
@@ -721,12 +768,13 @@ whatsappWebRouter.post('/send-document', async (req, res) => {
  */
 whatsappWebRouter.get('/groups', async (req, res) => {
   const companyId = (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   if (await isUnifiedMode(companyId)) {
-    const r = await forwardToTurnos('/groups', 'GET', undefined, companyId ? { companyId } : undefined)
+    const r = await forwardToTurnos('/groups', 'GET', undefined, companyId ? { companyId, userId } : undefined)
     return res.status(r.status).json(r.data)
   }
   try {
-    const groups = await listGroups(companyId)
+    const groups = await listGroups(companyId, userId)
     res.json({ groups })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudieron listar los grupos.' })
@@ -740,9 +788,10 @@ whatsappWebRouter.get('/groups', async (req, res) => {
 whatsappWebRouter.get('/resolve-invite', async (req, res) => {
   const link = (req.query.link as string) ?? ''
   const companyId = (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   if (!link) { res.status(400).json({ message: 'Parámetro "link" requerido.' }); return }
   try {
-    const group = await resolveGroupInvite(link, companyId)
+    const group = await resolveGroupInvite(link, companyId, userId)
     res.json(group)
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo resolver el enlace del grupo.' })
@@ -751,13 +800,14 @@ whatsappWebRouter.get('/resolve-invite', async (req, res) => {
 
 whatsappWebRouter.post('/logout', async (req, res) => {
   const companyId = (req.body?.companyId as string) || (req.query.companyId as string) || undefined
+  const userId = reqUserId(req)
   resetUnifiedCache()
   if (await isUnifiedMode(companyId)) {
-    const r = await forwardToTurnos('/logout', 'POST', { companyId })
+    const r = await forwardToTurnos('/logout', 'POST', { companyId, userId })
     return res.status(r.status).json(r.data)
   }
   try {
-    await clearSession(companyId)
+    await clearSession(companyId, userId)
     res.json({ message: 'Sesión cerrada. Escanea el QR para volver a conectar.' })
   } catch (err) {
     res.status(500).json({ message: err instanceof Error ? err.message : 'No se pudo cerrar la sesión.' })

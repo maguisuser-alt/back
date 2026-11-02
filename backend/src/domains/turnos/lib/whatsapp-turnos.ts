@@ -69,16 +69,33 @@ export function isWhatsAppTurnosEnabled(): boolean {
   return manager.isEnabled()
 }
 
-export function getStatus(companyId?: string) {
-  return manager.getStatus(companyId)
+export function getStatus(companyId?: string, userId?: string) {
+  return manager.getStatus(companyId, userId)
 }
 
-export function getQrDataUrl(companyId?: string): string | null {
-  return manager.getQrDataUrl(companyId)
+export function getQrDataUrl(companyId?: string, userId?: string): string | null {
+  return manager.getQrDataUrl(companyId, userId)
 }
 
-export async function startWhatsAppTurnos(companyId?: string): Promise<void> {
-  return manager.start(companyId)
+/** Código de vinculación (pairing code) pendiente, o null. */
+export function getPairingCode(companyId?: string, userId?: string): string | null {
+  return manager.getPairingCode(companyId, userId)
+}
+
+/**
+ * Solicita un código de vinculación para un número (alternativa al QR).
+ * `phoneNumber` en formato internacional solo dígitos (p. ej. 573001234567).
+ */
+export async function requestPairingCode(
+  companyId: string | undefined,
+  userId: string | undefined,
+  phoneNumber: string,
+): Promise<string> {
+  return manager.requestPairingCode(companyId, userId, phoneNumber)
+}
+
+export async function startWhatsAppTurnos(companyId?: string, userId?: string): Promise<void> {
+  return manager.start(companyId, userId)
 }
 
 /**
@@ -98,8 +115,8 @@ export function resumeSavedSessions(): Promise<void> {
 export const toJid = toJidShared
 
 /** Envía texto a un número o grupo. */
-export async function sendText(to: string, text: string, companyId?: string): Promise<{ id: string | null }> {
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, { text })
+export async function sendText(to: string, text: string, companyId?: string, userId?: string): Promise<{ id: string | null }> {
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, { text })
   return { id: res?.key?.id ?? null }
 }
 
@@ -111,10 +128,11 @@ export async function sendImage(
   image: Buffer | string,
   caption?: string,
   companyId?: string,
+  userId?: string,
 ): Promise<{ id: string | null }> {
   const msg: Record<string, unknown> = { image: typeof image === 'string' ? { url: image } : image }
   if (caption) msg.caption = caption
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, msg)
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, msg)
   return { id: res?.key?.id ?? null }
 }
 
@@ -128,6 +146,7 @@ export async function sendAlbum(
   images: Array<{ image: Buffer | string; caption?: string }>,
   caption?: string,
   companyId?: string,
+  userId?: string,
 ): Promise<{ id: string | null; count: number }> {
   if (images.length === 0) return { id: null, count: 0 }
 
@@ -142,7 +161,7 @@ export async function sendAlbum(
     // Si la imagen individual tiene su propio caption, se usa ese (prioridad).
     const finalCaption = it.caption ?? (i === 0 ? caption : undefined)
 
-    const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, {
+    const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
       image: img,
       ...(finalCaption ? { caption: finalCaption } : {}),
     })
@@ -169,6 +188,7 @@ export async function sendDocument(
   caption?: string,
   companyId?: string,
   mimetype?: string,
+  userId?: string,
 ): Promise<{ id: string | null }> {
   // Sin mimetype WhatsApp muestra el archivo como adjunto genérico. Lo inferimos
   // de la extensión del nombre si no viene explícito.
@@ -178,7 +198,7 @@ export async function sendDocument(
     mimetype: mimetype || guessMimeFromName(fileName),
   }
   if (caption) msg.caption = caption
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, msg)
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, msg)
   return { id: res?.key?.id ?? null }
 }
 
@@ -208,6 +228,7 @@ export async function sendAudio(
   audio: Buffer | string,
   companyId?: string,
   mimetype?: string,
+  userId?: string,
 ): Promise<{ id: string | null }> {
   // WhatsApp sólo reproduce notas de voz como audio/ogg (opus) o audio/mp4.
   // Chrome graba webm/opus (mismo códec opus); se reenvía declarando
@@ -221,7 +242,7 @@ export async function sendAudio(
     mimetype: finalMime,
     ptt: true,
   }
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, msg)
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, msg)
   return { id: res?.key?.id ?? null }
 }
 
@@ -246,6 +267,7 @@ export async function sendListMessage(
   buttonText: string,
   rows: ListRow[],
   companyId?: string,
+  userId?: string,
 ): Promise<{ id: string | null }> {
   const sections = [{
     title: 'Opciones',
@@ -262,7 +284,7 @@ export async function sendListMessage(
     sections,
     listType: 1,
   }
-  const res = await manager.sendContent<{ key: { id: string } }>(companyId, to, listMessage)
+  const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, listMessage)
   return { id: res?.key?.id ?? null }
 }
 
@@ -278,8 +300,9 @@ export async function sendButtonsMessage(
   text: string,
   buttons: Array<{ id: string; text: string }>,
   companyId?: string,
+  userId?: string,
 ): Promise<{ id: string | null }> {
-  const sock = await manager.waitForOpen(companyId)
+  const sock = await manager.waitForOpen(companyId, userId)
   const jid = toJid(to)
 
   const nativeButtons = buttons.slice(0, 3).map((b) => ({
@@ -312,15 +335,15 @@ export async function sendButtonsMessage(
 }
 
 /** Lista los grupos (id JID + nombre) de la cuenta conectada. */
-export async function listGroups(companyId?: string): Promise<Array<{ id: string; name: string }>> {
-  const sock = await manager.waitForOpen(companyId)
+export async function listGroups(companyId?: string, userId?: string): Promise<Array<{ id: string; name: string }>> {
+  const sock = await manager.waitForOpen(companyId, userId)
   const groups = await sock.groupFetchAllParticipating()
   return Object.values(groups).map((g) => ({ id: g.id, name: g.subject ?? g.id }))
 }
 
-/** Cierra la sesión y borra las credenciales de una compañía (fuerza nuevo QR). */
-export async function clearSession(companyId?: string): Promise<void> {
-  return manager.clearSession(companyId)
+/** Cierra la sesión y borra las credenciales de una compañía/usuario (fuerza nuevo QR). */
+export async function clearSession(companyId?: string, userId?: string): Promise<void> {
+  return manager.clearSession(companyId, userId)
 }
 
 /** Devuelve el último mensaje entrante de un JID (para leer respuestas). */
