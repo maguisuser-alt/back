@@ -26,6 +26,45 @@ export const whatsappWebRouter = Router()
 const COLLECTION = 'whatsapp_messages'
 
 /**
+ * Guarda anti-duplicados de envíos por WhatsApp.
+ *
+ * Un envío (foto/álbum/registro) NO es idempotente: si el cliente reintenta
+ * —o el usuario hace doble clic, o la red reenvía la petición— mientras el
+ * servidor sigue enviando, las fotos se DUPLICAN en el mismo chat. Esta guarda
+ * deduplica por clave lógica: mientras un envío igual está en curso se devuelve
+ * ese mismo resultado (sin reenviar) y, durante una ventana corta posterior, un
+ * segundo intento idéntico tampoco vuelve a enviar.
+ */
+const inFlightSends = new Map<string, Promise<unknown>>()
+const recentSends = new Map<string, { at: number; data: unknown }>()
+const DEDUPE_WINDOW_MS = 12_000
+
+function pruneRecentSends(): void {
+  const now = Date.now()
+  for (const [k, v] of recentSends) {
+    if (now - v.at > DEDUPE_WINDOW_MS) recentSends.delete(k)
+  }
+}
+
+/** Ejecuta un envío una sola vez por clave; devuelve el resultado ya producido. */
+async function sendOnce<T>(key: string, run: () => Promise<T>): Promise<{ data: T; deduped: boolean }> {
+  pruneRecentSends()
+  const recent = recentSends.get(key)
+  if (recent) return { data: recent.data as T, deduped: true }
+  const running = inFlightSends.get(key)
+  if (running) return { data: (await running) as T, deduped: true }
+  const started = run()
+  inFlightSends.set(key, started)
+  try {
+    const data = await started
+    recentSends.set(key, { at: Date.now(), data })
+    return { data, deduped: false }
+  } finally {
+    inFlightSends.delete(key)
+  }
+}
+
+/**
  * Usuario dueño de la sesión de WhatsApp. La vinculación es POR USUARIO dentro
  * de la compañía: se toma del usuario autenticado (`req.session.user`, inyectado
  * por requireToken) y, si el cliente envía `userId` explícito, este tiene
@@ -369,6 +408,11 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
     }
     if (!to) { res.status(400).json({ message: 'No hay destino de WhatsApp configurado para esta empresa.' }); return }
 
+    // Un envío por (registro + destino + modo) se hace UNA sola vez, aunque el
+    // cliente reintente o se pulse dos veces.
+    const sendKey = `op|${trackingCode}|${to}|${onlyHeader ? 'h' : 'f'}|${(hf ?? []).join(',')}`
+    const { data: result, deduped } = await sendOnce(sendKey, async () => {
+
     const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
     const PAUSE = 1500 // pausa entre mensajes (anti-spam)
 
@@ -409,8 +453,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
 
     // Si solo se pidió el encabezado, termina aquí (matriz mensaje×chat).
     if (onlyHeader) {
-      res.json({ message: 'Encabezado enviado.', to, sent })
-      return
+      return { message: 'Encabezado enviado.', to, sent }
     }
 
     // 2. Fotos generales y NOTAS de texto, en el orden del registro.
@@ -507,7 +550,9 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
       await delay(PAUSE)
     }
 
-    res.json({ message: `Registro enviado a WhatsApp (${sent} mensaje(s)).`, to, sent })
+    return { message: `Registro enviado a WhatsApp (${sent} mensaje(s)).`, to, sent }
+    })
+    res.json({ ...result, ...(deduped ? { deduped: true } : {}) })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar operación:', err)
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el registro.' })
@@ -564,8 +609,12 @@ whatsappWebRouter.post('/send-product', async (req, res) => {
     const obs = obsList.length ? `\n📝 ${obsList.join(' · ')}` : ''
     const caption = `📦 *${prod.productCode}*${desc}${obs}`
 
-    const r = await uSendAlbum(to, sendable.map((p) => p.driveUrl as string), caption, companyId, userId)
-    res.json({ message: `Producto ${productCode} enviado (${r.count} foto(s)).`, to, sent: r.count })
+    // Un producto (registro + destino) se envía UNA sola vez por ventana corta.
+    const { data: result, deduped } = await sendOnce(`prod|${trackingCode}|${to}|${productCode}`, async () => {
+      const r = await uSendAlbum(to, sendable.map((p) => p.driveUrl as string), caption, companyId, userId)
+      return { message: `Producto ${productCode} enviado (${r.count} foto(s)).`, to, sent: r.count }
+    })
+    res.json({ ...result, ...(deduped ? { deduped: true } : {}) })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar producto:', err)
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el producto.' })
@@ -618,8 +667,13 @@ whatsappWebRouter.post('/send-photo-group', async (req, res) => {
     // NO se usa stepName ("Registro fotográfico") como texto del mensaje.
     const withComment = sendable.find((p) => (p.comment ?? '').trim())
     const captionText = (withComment?.comment ?? '').trim() || undefined
-    const r = await uSendAlbum(to, sendable.map((p) => p.driveUrl as string), captionText, companyId, userId)
-    res.json({ message: `Álbum enviado (${r.count} foto(s)).`, to, sent: r.count })
+    // Clave estable: mismo registro + destino + conjunto exacto de fotos.
+    const groupKey = [...sendable.map((p) => p.driveUrl as string)].join('|')
+    const { data: result, deduped } = await sendOnce(`grp|${trackingCode}|${to}|${groupKey}`, async () => {
+      const r = await uSendAlbum(to, sendable.map((p) => p.driveUrl as string), captionText, companyId, userId)
+      return { message: `Álbum enviado (${r.count} foto(s)).`, to, sent: r.count }
+    })
+    res.json({ ...result, ...(deduped ? { deduped: true } : {}) })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar álbum:', err)
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el álbum.' })
@@ -677,21 +731,25 @@ whatsappWebRouter.post('/send-photo', async (req, res) => {
       res.status(400).json({ message: 'La foto aún no está disponible para envío (pendiente de subida).' }); return
     }
 
-    // Solo el comentario real del usuario; NO el stepName ("Registro
-    // fotográfico") como texto del mensaje.
-    const caption = (photo.comment ?? '').trim() || undefined
+    // Una foto concreta (registro + destino + índice) se envía UNA sola vez.
+    const { data: result, deduped } = await sendOnce(`ph|${trackingCode}|${to}|${idx}`, async () => {
+      // Solo el comentario real del usuario; NO el stepName ("Registro
+      // fotográfico") como texto del mensaje.
+      const caption = (photo.comment ?? '').trim() || undefined
 
-    // Audio, documento o imagen — usar el helper adecuado.
-    if (photo.mediaType === 'audio') {
-      const r = await uSendAudio(to, url, companyId, photo.mimeType, userId)
-      res.json({ message: 'Audio enviado a WhatsApp.', to, id: r.id })
-    } else if (photo.mediaType === 'document') {
-      const r = await uSendDocument(to, url, { fileName: photo.fileName, caption, mimetype: photo.mimeType }, companyId, userId)
-      res.json({ message: 'Documento enviado a WhatsApp.', to, id: r.id })
-    } else {
+      // Audio, documento o imagen — usar el helper adecuado.
+      if (photo.mediaType === 'audio') {
+        const r = await uSendAudio(to, url, companyId, photo.mimeType, userId)
+        return { message: 'Audio enviado a WhatsApp.', to, id: r.id }
+      }
+      if (photo.mediaType === 'document') {
+        const r = await uSendDocument(to, url, { fileName: photo.fileName, caption, mimetype: photo.mimeType }, companyId, userId)
+        return { message: 'Documento enviado a WhatsApp.', to, id: r.id }
+      }
       const r = await uSendImage(to, url, caption, companyId, userId)
-      res.json({ message: 'Foto enviada a WhatsApp.', to, id: r.id })
-    }
+      return { message: 'Foto enviada a WhatsApp.', to, id: r.id }
+    })
+    res.json({ ...result, ...(deduped ? { deduped: true } : {}) })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar foto individual:', err)
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar la foto.' })
