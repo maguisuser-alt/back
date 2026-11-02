@@ -433,6 +433,11 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
     const fin = op.completedAt ? fmt(op.completedAt as string) : ''
 
     let sent = 0
+    let failedParts = 0
+    const noteFailure = (label: string, err: unknown) => {
+      failedParts++
+      console.warn(`[whatsapp-web] ${label}:`, err instanceof Error ? err.message : err)
+    }
 
     // 1. Encabezado — se arma con solo los campos seleccionados por el usuario.
     const headerLines: string[] = [`📋 *Registro ${op.trackingCode}*`]
@@ -448,8 +453,13 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
     // Fallback: si se deseleccionaron todos los campos, incluye al menos el
     // operador para que el encabezado no quede solo con el código.
     if (headerLines.length === 1) headerLines.push(`👤 ${op.operatorName}`)
-    await uSendText(to, headerLines.join('\n'), companyId, userId); sent++
-    await delay(PAUSE)
+    try {
+      await uSendText(to, headerLines.join('\n'), companyId, userId)
+      sent++
+      await delay(PAUSE)
+    } catch (err) {
+      noteFailure('No se pudo enviar el encabezado del registro', err)
+    }
 
     // Si solo se pidió el encabezado, termina aquí (matriz mensaje×chat).
     if (onlyHeader) {
@@ -467,16 +477,20 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
         // Mensaje escrito del registro (nota de solo texto).
         const hora = item.timestamp ? fmt(item.timestamp) : ''
         const txt = hora ? `📝 ${item.comment}\n🕒 ${hora}` : `📝 ${item.comment}`
-        await uSendText(to, txt, companyId, userId)
-        sent++
-        await delay(PAUSE)
+        try {
+          await uSendText(to, txt, companyId, userId)
+          sent++
+          await delay(PAUSE)
+        } catch (err) {
+          noteFailure(`No se pudo enviar una nota del registro`, err)
+        }
         i++
         continue
       }
 
       // Audio: enviar como nota de voz, no como imagen.
       if (item.mediaType === 'audio' && hasUrl(item)) {
-        try { await uSendAudio(to, item.driveUrl as string, companyId, item.mimeType, userId) ; sent++ } catch { /* continúa */ }
+        try { await uSendAudio(to, item.driveUrl as string, companyId, item.mimeType, userId) ; sent++ } catch (err) { noteFailure('No se pudo enviar un audio del registro', err) }
         await delay(PAUSE)
         i++
         continue
@@ -487,7 +501,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
         try {
           await uSendDocument(to, item.driveUrl as string, { fileName: item.fileName, caption: item.comment, mimetype: item.mimeType }, companyId, userId)
           sent++
-        } catch { /* continúa */ }
+        } catch (err) { noteFailure('No se pudo enviar un documento del registro', err) }
         await delay(PAUSE)
         i++
         continue
@@ -509,15 +523,23 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
         // Caption: el comentario de la primera foto del grupo (si hay).
         const caption = (group[0].comment ?? '').trim() || undefined
         const urls = group.map((p) => p.driveUrl as string)
-        const r = await uSendAlbum(to, urls, caption, companyId, userId)
-        sent += r.count
+        try {
+          const r = await uSendAlbum(to, urls, caption, companyId, userId)
+          sent += r.count
+        } catch (err) {
+          noteFailure('No se pudo enviar un grupo de fotos del registro', err)
+        }
         i += group.length
       } else {
         // Solo el comentario real del usuario; NO el stepName ("Registro
         // fotográfico") que no debe enviarse como texto.
         const cap = (item.comment ?? '').trim() || undefined
-        await uSendImage(to, item.driveUrl as string, cap, companyId, userId)
-        sent++
+        try {
+          await uSendImage(to, item.driveUrl as string, cap, companyId, userId)
+          sent++
+        } catch (err) {
+          noteFailure('No se pudo enviar una foto del registro', err)
+        }
         i++
       }
       await delay(PAUSE)
@@ -545,12 +567,27 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
       const caption = `📦 *${prod.productCode}*${desc}${obs}`
 
       const urls = sendable.map((p) => p.driveUrl as string)
-      const r = await uSendAlbum(to, urls, caption, companyId, userId)
-      sent += r.count
+      try {
+        const r = await uSendAlbum(to, urls, caption, companyId, userId)
+        sent += r.count
+      } catch (err) {
+        noteFailure(`No se pudo enviar el producto ${prod.productCode}`, err)
+      }
       await delay(PAUSE)
     }
 
-    return { message: `Registro enviado a WhatsApp (${sent} mensaje(s)).`, to, sent }
+    if (sent === 0 && failedParts > 0) {
+      throw new Error('No se pudo completar el envío del registro por WhatsApp.')
+    }
+    return failedParts > 0
+      ? {
+          message: `Registro enviado parcialmente a WhatsApp (${sent} mensaje(s)).`,
+          to,
+          sent,
+          partial: true,
+          failedParts,
+        }
+      : { message: `Registro enviado a WhatsApp (${sent} mensaje(s)).`, to, sent, partial: false, failedParts: 0 }
     })
     res.json({ ...result, ...(deduped ? { deduped: true } : {}) })
   } catch (err) {
