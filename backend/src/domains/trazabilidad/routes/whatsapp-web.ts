@@ -397,6 +397,22 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
     const op = await getOperationsCollection().findOne({ trackingCode })
     if (!op) { res.status(404).json({ message: 'Operación no encontrada.' }); return }
 
+    // Re-firma las URLs de R2 (caducan a los ~7 días) para que Baileys pueda
+    // descargar los bytes. Sin esto, las fotos antiguas devolvían 403 y no se
+    // enviaban. Es best-effort: con base pública o sin R2, no altera nada.
+    {
+      const { refreshPhotoUrls } = await import('../lib/storage.js')
+      if (Array.isArray(op.photos)) op.photos = await refreshPhotoUrls(op.photos as Array<{ fileId?: string; driveUrl?: string }>)
+      if (Array.isArray(op.lineaBlanca)) {
+        op.lineaBlanca = await Promise.all(
+          (op.lineaBlanca as Array<{ photos?: Array<{ fileId?: string; driveUrl?: string }> }>).map(async (p) => ({
+            ...p,
+            photos: Array.isArray(p.photos) ? await refreshPhotoUrls(p.photos) : p.photos,
+          })),
+        )
+      }
+    }
+
     // Sesión de WhatsApp de ESTA empresa (multi-tenant).
     const companyId = (op.companyId as string | undefined) || undefined
 

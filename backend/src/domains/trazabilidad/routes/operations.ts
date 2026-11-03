@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { getOperationsCollection, getProductsCatalogCollection, getMovementsCollection, getDb } from '../lib/mongodb.js'
 import { generateTrackingCode } from '../lib/tracking-code.js'
 import { uploadToDrive, deletePhotoStorage } from '../lib/drive-upload.js'
+import { refreshPhotoUrls } from '../lib/storage.js'
 import { sendOperationEmail } from '../lib/email.js'
 import { getStepsForType, LINEA_BLANCA_STEPS, OPTIONAL_STEPS, normalizeClientTimestamp, type CompanyLocation, type LineaBlancaProduct, type LocationRef, type OperationType, type PhotoRecord } from '../types.js'
 import { existingClientKeys, isDuplicateKey } from '../lib/photo-dedupe.js'
@@ -46,6 +47,29 @@ async function logActivity(
 /** Borra todas las fotos (R2+GitHub) de una lista de registros de foto. */
 async function deleteAllPhotosStorage(photos: Array<{ fileId?: string; driveUrl?: string }>): Promise<void> {
   for (const ph of photos) await deletePhotoStorage(ph)
+}
+
+/**
+ * Devuelve una copia de la operación con las URLs de sus fotos re-firmadas.
+ *
+ * Las URLs firmadas de R2 que se guardan en Mongo caducan (default 7 días), lo
+ * que hacía que las fotos antiguas dejaran de cargar. Aquí se regenera la firma
+ * a partir de la key (`fileId`) justo antes de responder, tanto para las fotos
+ * del registro (`photos`) como para las de cada producto (`lineaBlanca`). Es
+ * best-effort: si no hay R2 o hay base pública, devuelve la operación sin tocar.
+ */
+async function withFreshPhotoUrls<T extends Record<string, unknown>>(operation: T): Promise<T> {
+  const photos = operation.photos as PhotoRecord[] | undefined
+  const lineaBlanca = operation.lineaBlanca as LineaBlancaProduct[] | undefined
+
+  const [freshPhotos, freshLineaBlanca] = await Promise.all([
+    Array.isArray(photos) ? refreshPhotoUrls(photos) : Promise.resolve(photos),
+    Array.isArray(lineaBlanca)
+      ? Promise.all(lineaBlanca.map(async (p) => ({ ...p, photos: await refreshPhotoUrls(p.photos ?? []) })))
+      : Promise.resolve(lineaBlanca),
+  ])
+
+  return { ...operation, photos: freshPhotos, lineaBlanca: freshLineaBlanca }
 }
 
 const VALID_TYPES: OperationType[] = ['PRODUCTOS_ENTRANTES', 'PRODUCTOS_SALIENTES', 'ACTIVIDAD']
@@ -285,8 +309,14 @@ operationsRouter.get('/', async (req, res) => {
       col.countDocuments(filter),
     ])
 
+    // Re-firma las URLs de R2 (caducan) antes de devolverlas para que las
+    // miniaturas del historial no aparezcan rotas en operaciones antiguas.
+    const freshOperations = await Promise.all(
+      operations.map((op) => withFreshPhotoUrls(op as Record<string, unknown>)),
+    )
+
     res.json({
-      operations,
+      operations: freshOperations,
       pagination: { page: pageNum, limit: limitNum, total, pages: Math.ceil(total / limitNum) },
     })
   } catch (err) {
@@ -574,12 +604,13 @@ operationsRouter.post('/products-catalog/:productCode/photo', async (req, res) =
       companyId: companyId as string | undefined,
     })
 
-    let fileId = driveResult.fileId ?? ''
-    let driveUrl = driveResult.driveUrl ?? ''
+    const fileId = driveResult.fileId ?? ''
+    const driveUrl = driveResult.driveUrl ?? ''
     if (driveResult.status === 'error') {
       if ((driveResult.message ?? '').includes('no configurado')) { res.status(502).json({ message: 'Almacenamiento no configurado en el servidor (R2 o GitHub).' }); return }
-      fileId = fileId || 'pending'
-      driveUrl = driveUrl || 'pending-verification'
+      // Fallo transitorio: no persistir marcador roto; pedir reintento (503).
+      console.error(`[catalogo] Subida de foto fallida: ${driveResult.message}`)
+      res.status(503).json({ message: 'No se pudo subir la imagen al almacenamiento. Reintenta en unos segundos.', detail: driveResult.message }); return
     }
 
     const photo = { fileId, driveUrl, comment: comment?.trim() || undefined, timestamp: new Date().toISOString() }
@@ -785,8 +816,9 @@ operationsRouter.get('/:trackingCode', async (req, res) => {
     }
 
     const steps = getStepsForType(operation.operationType as OperationType)
+    const fresh = await withFreshPhotoUrls(operation as Record<string, unknown>)
     res.json({
-      ...operation,
+      ...fresh,
       steps,
       totalSteps: steps.length,
       lineaBlancaSteps: [...LINEA_BLANCA_STEPS],
@@ -1021,8 +1053,8 @@ operationsRouter.post('/:trackingCode/linea-blanca/:productCode/photo', async (r
       companyId: operation.companyId as string | undefined,
     })
 
-    let fileId = driveResult.fileId ?? ''
-    let driveUrl = driveResult.driveUrl ?? ''
+    const fileId = driveResult.fileId ?? ''
+    const driveUrl = driveResult.driveUrl ?? ''
 
     if (driveResult.status === 'error') {
       const errorMsg = driveResult.message ?? ''
@@ -1030,9 +1062,13 @@ operationsRouter.post('/:trackingCode/linea-blanca/:productCode/photo', async (r
         res.status(502).json({ message: 'Error al subir la imagen: almacenamiento no configurado en el servidor.', detail: errorMsg })
         return
       }
-      console.warn(`[linea-blanca] GAS: ${errorMsg}. Registrando igualmente.`)
-      fileId = fileId || 'pending'
-      driveUrl = driveUrl || 'pending-verification'
+      // Fallo transitorio de subida: no persistir un marcador roto
+      // ('pending-verification'). Respondemos 503 para que el cliente conserve
+      // la foto en cache y la reintente (tiene backoff). Antes se registraba
+      // igualmente y la foto quedaba como cuadro gris permanente.
+      console.error(`[linea-blanca] Subida de foto fallida: ${errorMsg}`)
+      res.status(503).json({ message: 'No se pudo subir la imagen al almacenamiento. Reintenta en unos segundos.', detail: errorMsg })
+      return
     }
 
     const photoRecord: PhotoRecord = {
@@ -1174,8 +1210,14 @@ operationsRouter.post('/:trackingCode/linea-blanca/:productCode/photo-batch', as
         companyId: operation.companyId as string | undefined,
       })
 
-      if (driveResult.status === 'error' && (driveResult.message ?? '').includes('no configurado')) {
-        res.status(502).json({ message: 'Almacenamiento no configurado en el servidor (R2 o GitHub).' }); return
+      if (driveResult.status === 'error') {
+        if ((driveResult.message ?? '').includes('no configurado')) {
+          res.status(502).json({ message: 'Almacenamiento no configurado en el servidor (R2 o GitHub).' }); return
+        }
+        // Fallo transitorio: no persistir marcador roto; pedir reintento (503).
+        // La idempotencia por clientKey evita duplicar las ya subidas.
+        console.error(`[linea-blanca] Subida fallida (batch) foto ${i + 1}: ${driveResult.message}`)
+        res.status(503).json({ message: 'No se pudo subir la imagen al almacenamiento. Reintenta en unos segundos.', detail: driveResult.message }); return
       }
 
       const fileId = driveResult.fileId || 'pending'

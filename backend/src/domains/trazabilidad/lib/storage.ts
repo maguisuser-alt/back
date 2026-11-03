@@ -110,6 +110,63 @@ export async function getSignedImageUrl(key: string, ttlSeconds?: number): Promi
   return getSignedUrl(client, new GetObjectCommand({ Bucket: getBucket(), Key: key }), { expiresIn: ttl })
 }
 
+/** True si hay base pública permanente (no hace falta re-firmar). */
+export function hasPublicBase(): boolean {
+  return Boolean(process.env.R2_PUBLIC_BASE_URL)
+}
+
+/**
+ * Indica si una `fileId` corresponde a una key de objeto en R2 (y por tanto su
+ * URL firmada puede regenerarse). Excluye marcadores (`pending`, `note`) y las
+ * rutas de GitHub (que son URLs permanentes, no keys de R2).
+ */
+function isR2Key(fileId: string | undefined | null): fileId is string {
+  if (!fileId) return false
+  if (fileId === 'pending' || fileId === 'note') return false
+  // Las keys de R2 son rutas lógicas tipo `operations/<tc>/<archivo>.jpg`.
+  return fileId.includes('/')
+}
+
+/** True si la driveUrl es una URL firmada de R2 (lleva la firma de S3 en el query). */
+function isSignedR2Url(url: string | undefined | null): boolean {
+  if (!url) return false
+  return /r2\.cloudflarestorage\.com/.test(url) && /[?&]X-Amz-/.test(url)
+}
+
+/**
+ * Rehidrata la URL de una foto almacenada en R2 con una firma FRESCA.
+ *
+ * Las URLs firmadas que se guardan en MongoDB al subir caducan (default 7 días),
+ * lo que hace que las fotos antiguas dejen de cargar. Esta función regenera la
+ * firma a partir de la key (`fileId`) justo al servir la operación, de modo que
+ * el enlace siempre esté vigente.
+ *
+ * Es best-effort y no destructiva:
+ *  - Si hay base pública (`R2_PUBLIC_BASE_URL`), las URLs ya son permanentes y no
+ *    se tocan.
+ *  - Solo re-firma fotos cuyo `fileId` es una key de R2 y cuya `driveUrl` es una
+ *    URL firmada de R2 (o un marcador `pending-verification`, intentando
+ *    recuperarla desde la key). No altera URLs de GitHub ni de Drive.
+ *  - Si la firma falla, deja la foto como estaba.
+ */
+export async function refreshPhotoUrl<T extends { fileId?: string; driveUrl?: string }>(photo: T): Promise<T> {
+  if (hasPublicBase() || !isStorageConfigured()) return photo
+  const needsRefresh = isR2Key(photo.fileId) && (isSignedR2Url(photo.driveUrl) || photo.driveUrl === 'pending-verification' || !photo.driveUrl)
+  if (!needsRefresh) return photo
+  try {
+    const url = await getSignedImageUrl(photo.fileId as string)
+    return { ...photo, driveUrl: url }
+  } catch {
+    return photo
+  }
+}
+
+/** Rehidrata en paralelo las URLs firmadas de R2 de un arreglo de fotos. */
+export async function refreshPhotoUrls<T extends { fileId?: string; driveUrl?: string }>(photos: T[]): Promise<T[]> {
+  if (hasPublicBase() || !isStorageConfigured() || !Array.isArray(photos) || photos.length === 0) return photos
+  return Promise.all(photos.map((p) => refreshPhotoUrl(p)))
+}
+
 /** Elimina un objeto del bucket. */
 export async function deleteObject(key: string): Promise<void> {
   const client = getClient()

@@ -126,15 +126,16 @@ photosRouter.post('/upload', async (req, res) => {
 
     const driveResult = await uploadToDrive({ base64Image, fileName, mimeType: mimeType || 'image/jpeg', subfolderName, subSubfolderName, companyId: operation.companyId as string | undefined })
 
-    let fileId = driveResult.fileId ?? ''
-    let driveUrl = driveResult.driveUrl ?? ''
+    const fileId = driveResult.fileId ?? ''
+    const driveUrl = driveResult.driveUrl ?? ''
 
     if (driveResult.status === 'error') {
       if ((driveResult.message ?? '').includes('no configurado')) {
         res.status(502).json({ message: 'Almacenamiento no configurado en el servidor (R2 o GitHub).' }); return
       }
-      fileId = fileId || 'pending'
-      driveUrl = driveUrl || 'pending-verification'
+      // Fallo transitorio: no persistir marcador roto; pedir reintento (503).
+      console.error(`[photos] Subida fallida (upload): ${driveResult.message}`)
+      res.status(503).json({ message: 'No se pudo subir la imagen al almacenamiento. Reintenta en unos segundos.', detail: driveResult.message }); return
     }
 
     const photoRecord: PhotoRecord = {
@@ -221,8 +222,18 @@ photosRouter.post('/upload-batch', async (req, res) => {
         companyId: operation.companyId as string | undefined,
       })
 
-      if (driveResult.status === 'error' && (driveResult.message ?? '').includes('no configurado')) {
-        res.status(502).json({ message: 'Almacenamiento no configurado en el servidor (R2 o GitHub).' }); return
+      if (driveResult.status === 'error') {
+        if ((driveResult.message ?? '').includes('no configurado')) {
+          res.status(502).json({ message: 'Almacenamiento no configurado en el servidor (R2 o GitHub).' }); return
+        }
+        // Fallo transitorio de subida (R2/GitHub caído, timeout, rate limit).
+        // NO persistir un marcador roto ('pending-verification'): respondemos
+        // 503 para que el cliente conserve las fotos en cache y reintente (tiene
+        // backoff). La idempotencia por clientKey evita duplicar las que ya
+        // subieron en un intento anterior. Antes se fingía éxito y la foto se
+        // perdía para siempre como cuadro gris.
+        console.error(`[photos] Subida fallida (batch) foto ${i + 1}: ${driveResult.message}`)
+        res.status(503).json({ message: 'No se pudo subir la imagen al almacenamiento. Reintenta en unos segundos.', detail: driveResult.message }); return
       }
 
       const fileId = driveResult.fileId || 'pending'
@@ -301,14 +312,27 @@ photosRouter.post('/note', async (req, res) => {
   }
 })
 
+/** True si una foto nunca llegó al almacenamiento (binario perdido). */
+function isUnrecoverablePhoto(p: PhotoRecord): boolean {
+  // 'note' es un mensaje de solo texto, no una foto; no cuenta como rota.
+  if (p.fileId === 'note') return false
+  const noFile = !p.fileId || p.fileId === 'pending'
+  const noUrl = !p.driveUrl || p.driveUrl === 'pending-verification'
+  return noFile && noUrl
+}
+
 /**
  * POST /api/photos/sync/:trackingCode
- * OBSOLETO desde la migración a R2.
  *
- * Antes servía para recuperar los fileId de Drive cuando una subida quedaba
- * "pending". Con R2 la subida es síncrona y la foto queda con su URL final al
- * instante, así que no hay nada que sincronizar. Se mantiene el endpoint para
- * no romper el frontend que aún lo invoca; responde de forma idempotente.
+ * Diagnóstico de integridad de las fotos de una operación. Con R2/GitHub la
+ * subida es síncrona, así que no hay "sincronización" pendiente de Drive. Lo
+ * que sí puede existir son fotos cuya subida al almacenamiento falló en el
+ * pasado (antes del fix) y quedaron con `fileId='pending'`/
+ * `driveUrl='pending-verification'`: su binario se perdió y no es recuperable.
+ *
+ * Este endpoint CUENTA esas fotos irrecuperables (en `photos` y en cada
+ * producto de `lineaBlanca`) y las reporta para que el operador sepa cuáles
+ * volver a tomar. NO borra ni modifica nada (operación de solo lectura).
  */
 photosRouter.post('/sync/:trackingCode', async (req, res) => {
   const { trackingCode } = req.params
@@ -316,10 +340,31 @@ photosRouter.post('/sync/:trackingCode', async (req, res) => {
     const col = getOperationsCollection()
     const operation = await col.findOne({ trackingCode })
     if (!operation) { res.status(404).json({ message: 'Operación no encontrada.' }); return }
-    res.json({ message: 'Las fotos ya están sincronizadas (almacenamiento en la nube).', filesInDrive: 0, updated: 0 })
+
+    const topPhotos = (operation.photos as PhotoRecord[]) ?? []
+    const products = (operation.lineaBlanca as Array<{ productCode: string; photos?: PhotoRecord[] }>) ?? []
+
+    const brokenGeneral = topPhotos.filter(isUnrecoverablePhoto).length
+    const brokenByProduct = products
+      .map((p) => ({ productCode: p.productCode, broken: (p.photos ?? []).filter(isUnrecoverablePhoto).length }))
+      .filter((p) => p.broken > 0)
+    const brokenProductTotal = brokenByProduct.reduce((s, p) => s + p.broken, 0)
+    const unrecoverable = brokenGeneral + brokenProductTotal
+
+    res.json({
+      message: unrecoverable === 0
+        ? 'Todas las fotos están correctamente almacenadas.'
+        : `${unrecoverable} foto(s) no se subieron y deben volver a tomarse.`,
+      unrecoverable,
+      brokenGeneral,
+      brokenByProduct,
+      // Compat con clientes antiguos que leían estos campos.
+      filesInDrive: 0,
+      updated: 0,
+    })
   } catch (err) {
     console.error('[photos/sync] Error:', err)
-    res.status(500).json({ message: 'Error al sincronizar.' })
+    res.status(500).json({ message: 'Error al verificar las fotos.' })
   }
 })
 
