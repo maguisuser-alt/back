@@ -50,6 +50,20 @@ services:
       - key: ENABLE_WHATSAPP_WEB
         value: "true"
 
+      # ── Almacenamiento de fotos (Trazabilidad) ──
+      # El backend sube las fotos a GitHub (raw.githubusercontent.com) como
+      # object storage. SIN estas variables las fotos NO se guardan (quedan
+      # pendientes en el dispositivo y se reintentan). El token es secreto
+      # (sync: false → se rellena en el panel de Render). Alternativa: R2_*.
+      - key: GITHUB_OWNER
+        value: maguisuser02-eng
+      - key: GITHUB_REPO
+        value: Data-img
+      - key: GITHUB_BRANCH
+        value: main
+      - key: GITHUB_TOKEN
+        sync: false
+
       # ── URLs públicas / CORS ──
       - key: APP_PUBLIC_URL
         sync: false
