@@ -16,15 +16,22 @@ async function syncTracerFeatures(companyId: string, settings: {
   whatsappUnified?: boolean; whatsappAudio?: boolean; whatsappCatalog?: boolean
   whatsappDocument?: boolean; markerEditor?: boolean; registrarActividad?: boolean
   operationTypesLimit?: number
-}) {
+}, authHeader?: string) {
   if (!TRACER_API_URL) {
     console.warn('[root] TRACER_API_URL no configurado: no se sincronizarán las features de trazabilidad con el backend del tracer.')
     return
   }
   try {
+    // El endpoint del tracer está protegido con `requireToken`. Si no reenviamos
+    // el token del root, responde 401 y los cambios de configuración se guardan
+    // solo en la empresa (BD de turnos) pero NUNCA llegan a trazabilidad, por lo
+    // que la app seguía mostrando la configuración anterior.
     const res = await fetch(`${TRACER_API_URL}/settings/features`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
       body: JSON.stringify({ companyId, ...settings, source: 'root' }),
     })
     if (!res.ok) {
@@ -102,17 +109,51 @@ rootRouter.get('/companies', async (_request, response) => {
 // ── PATCH /api/root/companies/:companyId ────────────────────────────────────
 rootRouter.patch('/companies/:companyId', async (request, response) => {
   const { companyId } = request.params
-  const { activa } = request.body as { activa?: boolean }
+  const { activa, nombre, nit, correo, telefono, direccion, ciudad, tipo } = request.body as {
+    activa?: boolean
+    nombre?: string
+    nit?: string
+    correo?: string
+    telefono?: string
+    direccion?: string
+    ciudad?: string
+    tipo?: CompanyType
+  }
 
-  if (typeof activa !== 'boolean') {
-    response.status(400).json({ message: 'El campo "activa" (boolean) es requerido.' })
+  const update: Record<string, unknown> = {}
+
+  if (typeof activa === 'boolean') update.activa = activa
+  if (typeof nombre === 'string' && nombre.trim()) update.nombre = nombre.trim()
+  if (typeof nit === 'string' && nit.trim()) update.nit = nit.trim()
+  if (typeof correo === 'string' && correo.trim()) update.correo = correo.trim()
+  if (typeof telefono === 'string') update.telefono = telefono.trim()
+  if (typeof direccion === 'string') update.direccion = direccion.trim()
+  if (typeof ciudad === 'string') update.ciudad = ciudad.trim()
+  if (tipo === 'empresa' || tipo === 'academia') update.tipo = tipo
+
+  if (Object.keys(update).length === 0) {
+    response.status(400).json({ message: 'Envía al menos un campo válido para actualizar la empresa.' })
     return
   }
 
   const companiesCol = await getCompaniesCollection()
+  const currentCompany = await companiesCol.findOne({ id: companyId })
+  if (!currentCompany) {
+    response.status(404).json({ message: 'Empresa no encontrada.' })
+    return
+  }
+
+  if (typeof update.nit === 'string' && update.nit !== currentCompany.nit) {
+    const existing = await companiesCol.findOne({ nit: update.nit, id: { $ne: companyId } as any })
+    if (existing) {
+      response.status(409).json({ message: 'Ya existe otra empresa con ese NIT.' })
+      return
+    }
+  }
+
   const result = await companiesCol.updateOne(
     { id: companyId },
-    { $set: { activa } },
+    { $set: update },
   )
 
   if (result.matchedCount === 0) {
@@ -120,7 +161,15 @@ rootRouter.patch('/companies/:companyId', async (request, response) => {
     return
   }
 
-  response.json({ message: `Empresa ${activa ? 'activada' : 'desactivada'} correctamente.`, activa })
+  response.json({
+    message: typeof activa === 'boolean'
+      ? `Empresa ${activa ? 'activada' : 'desactivada'} correctamente.`
+      : 'Empresa actualizada correctamente.',
+    company: {
+      ...currentCompany,
+      ...update,
+    },
+  })
 })
 
 // ── POST /api/root/companies/:companyId/assign-admin ────────────────────────
@@ -288,7 +337,7 @@ rootRouter.patch('/companies/:companyId/modules', async (request, response) => {
   }
 
   if (trazabilidadSettings && typeof trazabilidadSettings === 'object') {
-    void syncTracerFeatures(companyId, update['settings.trazabilidadSettings'] as any)
+    void syncTracerFeatures(companyId, update['settings.trazabilidadSettings'] as any, request.headers.authorization)
   }
 
   response.json({ message: 'Módulos actualizados correctamente.', enabledModules, trazabilidadSettings: update['settings.trazabilidadSettings'] })

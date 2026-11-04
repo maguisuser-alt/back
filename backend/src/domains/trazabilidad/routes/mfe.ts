@@ -52,10 +52,16 @@ mfeRouter.get('/config-state', async (req, res) => {
   try {
     const doc = await getDb().collection('company_settings').findOne({ companyId }) as Record<string, unknown> | null
     const allowed = readAllowed(doc)
+
+    // Devuelve un objeto plano con todas las claves del esquema para que panel-root
+    // pueda mapearlas directamente a los controles de la UI.
     res.json({
+      ...allowed,
+      emailTo: (doc?.emailTo as string) ?? '',
+      operationTypesLimit: readOperationTypesLimit(doc),
+      // Mantiene compatibilidad con el contrato anterior por si acaso.
       companyId,
       allowedFeatures: allowed,
-      operationTypesLimit: readOperationTypesLimit(doc),
       integrations: { turnos: { linked: turnosLinked(allowed) } },
     })
   } catch (err) {

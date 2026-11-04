@@ -10,6 +10,9 @@ build/
 .env.*
 !.env.example
 
+# ── Inventario local de credenciales (NUNCA versionar) ──
+CREDENCIALES.md
+
 # ── Runtime portable de Node (no versionar binarios) ──
 _node/
 

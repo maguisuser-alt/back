@@ -12,6 +12,8 @@ export const FEATURE_KEYS = [
   'addProduct', 'selectImage', 'pasteImage',
   // Lugares/ubicaciones: identificar dónde se hace la operación y ubicar productos.
   'locationsEnabled',
+  // Marca de agua en fotos.
+  'watermark', 'watermarkDate', 'watermarkTime', 'watermarkLocation',
 ] as const
 export type FeatureKey = typeof FEATURE_KEYS[number]
 
@@ -28,7 +30,10 @@ export const TURNOS_API_URL = (process.env.TURNOS_API_URL || '').replace(/\/$/, 
  */
 /** Acciones base del registro: permitidas por defecto (default-on). Solo se
  *  consideran denegadas si el ROOT las apaga explícitamente (=== false). */
-export const DEFAULT_ON_KEYS: readonly FeatureKey[] = ['addProduct', 'selectImage', 'pasteImage', 'locationsEnabled']
+export const DEFAULT_ON_KEYS: readonly FeatureKey[] = [
+  'addProduct', 'selectImage', 'pasteImage', 'locationsEnabled',
+  'watermark', 'watermarkDate', 'watermarkTime', 'watermarkLocation',
+]
 
 export function readAllowed(doc: Record<string, unknown> | null): Record<FeatureKey, boolean> {
   const stored = (doc?.allowedFeatures ?? null) as Record<string, unknown> | null

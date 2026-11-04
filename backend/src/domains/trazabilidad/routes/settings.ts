@@ -423,16 +423,14 @@ settingsRouter.get('/features', async (req, res) => {
     const db = getDb()
     const doc = await db.collection(COLLECTION).findOne({ companyId }) as Record<string, unknown> | null
     const allowed = readAllowed(doc)
-    // El root es la autoridad: el valor EFECTIVO de cada función es exactamente
-    // lo que el root permitió. Si el root la activa, la función aparece y queda
-    // activa en el cliente de inmediato (sin depender de un flag secundario que
-    // el admin pudiera haber dejado en false). Si el root la apaga, desaparece.
-    const eff = (k: FeatureKey) => allowed[k] === true
-    // Acciones base del registro: activas por defecto. Solo se consideran
-    // desactivadas si el ROOT las apagó EXPLÍCITAMENTE (clave === false).
-    // Así, empresas existentes (sin estas claves) las siguen viendo.
-    const storedAllowed = (doc?.allowedFeatures ?? null) as Record<string, unknown> | null
-    const effDefaultOn = (k: FeatureKey) => storedAllowed?.[k] !== false
+    // Valor EFECTIVO de una función: activa solo si (a) el ROOT la permitió y
+    // (b) la empresa NO la desactivó explícitamente (`doc[k] === false`).
+    // El root es la autoridad sobre QUÉ se permite; el admin de la empresa
+    // decide, dentro de lo permitido, si la usa o no. Antes se devolvía solo
+    // `allowed[k]`, así que al apagar una opción en Configuración el cambio se
+    // guardaba pero el GET la reportaba activa de nuevo (no se reflejaba en el
+    // registro). Incluir `doc[k]` hace que el guardado del admin surta efecto.
+    const eff = (k: FeatureKey) => allowed[k] === true && doc?.[k] !== false
     const opLimit = typeof doc?.operationTypesLimit === 'number' ? doc.operationTypesLimit : DEFAULT_OPERATION_TYPES_LIMIT
     res.json({
       sheetsEnabled: eff('sheetsEnabled'),
@@ -445,10 +443,14 @@ settingsRouter.get('/features', async (req, res) => {
       whatsappDocument: eff('whatsappDocument'),
       markerEditor: eff('markerEditor'),
       registrarActividad: eff('registrarActividad'),
-      locationsEnabled: effDefaultOn('locationsEnabled'),
-      addProduct: effDefaultOn('addProduct'),
-      selectImage: effDefaultOn('selectImage'),
-      pasteImage: effDefaultOn('pasteImage'),
+      locationsEnabled: eff('locationsEnabled'),
+      addProduct: eff('addProduct'),
+      selectImage: eff('selectImage'),
+      pasteImage: eff('pasteImage'),
+      watermark: eff('watermark'),
+      watermarkDate: eff('watermarkDate'),
+      watermarkTime: eff('watermarkTime'),
+      watermarkLocation: eff('watermarkLocation'),
       operationTypesLimit: opLimit,
       // `allowed`: qué funciones concedió el root (para que el panel del cliente
       // oculte/bloquee las no permitidas, incluso para el admin principal).
@@ -501,6 +503,10 @@ settingsRouter.put('/features', async (req, res) => {
       // El root también define el límite de tipos de operación personalizados.
       if (typeof body.operationTypesLimit === 'number' && body.operationTypesLimit >= 0) {
         $set.operationTypesLimit = Math.round(body.operationTypesLimit)
+      }
+      // El root también puede definir el correo destinatario inicial.
+      if (typeof body.emailTo === 'string') {
+        $set.emailTo = body.emailTo.trim()
       }
     } else {
       // Admin de empresa: ignora cualquier función NO permitida por el root.
