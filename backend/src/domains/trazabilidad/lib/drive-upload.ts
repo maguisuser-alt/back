@@ -88,7 +88,13 @@ export async function uploadToDrive(payload: DriveUploadPayload): Promise<DriveU
     }
   }
 
-  // 3. Ninguno configurado.
+  // 3. Ninguno configurado. NO se embebe la imagen como data URL inline: fotos
+  // a tamaño completo en base64 (cientos de KB c/u) guardadas en Mongo y luego
+  // renderizadas todas juntas agotaban la memoria del WebView y CERRABAN la
+  // vista de trazabilidad. En su lugar se devuelve error "no configurado": los
+  // endpoints de fotos responden 502/503 y el cliente conserva las fotos en su
+  // caché local (IndexedDB), las muestra desde ahí y reintenta la subida cuando
+  // el almacenamiento esté disponible (con backoff). Así nunca se cae la vista.
   console.warn('[storage] Sin almacenamiento configurado (R2 ni GitHub).')
   return { status: 'error', message: 'Almacenamiento no configurado. Define las variables R2_* o GITHUB_* en el servidor.' }
 }
@@ -101,7 +107,7 @@ export async function deletePhotoStorage(photo: { fileId?: string; driveUrl?: st
   const fileId = photo.fileId
   const driveUrl = photo.driveUrl
   // R2: fileId es una key (sin ser 'pending'/'note').
-  if (fileId && fileId !== 'pending' && fileId !== 'note') {
+  if (fileId && fileId !== 'pending' && fileId !== 'note' && fileId !== 'inline') {
     try {
       const { deleteObject } = await import('./storage.js')
       await deleteObject(fileId)
