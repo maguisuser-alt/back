@@ -15,6 +15,7 @@ import { photosRouter } from './routes/photos.js'
 import { settingsRouter } from './routes/settings.js'
 import { mfeRouter } from './routes/mfe.js'
 import { sheetsRouter } from './routes/sheets.js'
+import { receivedRouter } from './routes/received.js'
 import { uploadsRouter } from './routes/uploads.js'
 import { whatsappRouter } from './routes/whatsapp.js'
 import { whatsappWebRouter } from './routes/whatsapp-web.js'
@@ -38,6 +39,7 @@ trazabilidadRouter.use('/api/photos', requireToken, photosRouter)
 trazabilidadRouter.use('/api/settings', requireToken, settingsRouter)
 trazabilidadRouter.use('/api/mfe', requireToken, mfeRouter)
 trazabilidadRouter.use('/api/sheets', requireToken, sheetsRouter)
+trazabilidadRouter.use('/api/received', requireToken, receivedRouter)
 trazabilidadRouter.use('/api/uploads', requireToken, uploadsRouter)
 trazabilidadRouter.use('/api/whatsapp', requireToken, whatsappRouter)
 // WhatsApp Web (Baileys, vía QR) — módulo opcional, solo si está habilitado.
