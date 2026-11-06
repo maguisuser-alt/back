@@ -3,7 +3,7 @@
  * Apps Script se usa SOLO para subir fotos faciales a Google Drive.
  */
 import { nanoid } from 'nanoid'
-import { nightHoursBetween } from './geo.js'
+import { computeHours } from './hours.js'
 import {
   getAcademicCoursesCollection,
   getAcademicEventsCollection,
@@ -330,18 +330,6 @@ export async function findUserInvitationByToken(token: string): Promise<UserInvi
 
 // ── Horas por Turno ──────────────────────────────────────────────────────────
 
-const festivosColombia2026 = new Set([
-  '2026-01-01', '2026-01-12', '2026-03-23', '2026-04-02', '2026-04-03',
-  '2026-05-01', '2026-05-18', '2026-06-08', '2026-06-15', '2026-06-29',
-  '2026-07-20', '2026-08-07', '2026-08-17', '2026-10-12', '2026-11-02',
-  '2026-11-16', '2026-12-08', '2026-12-25',
-])
-
-function getDiaSemana(fecha: string): string {
-  const dias = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado']
-  return dias[new Date(fecha + 'T12:00:00').getDay()] ?? ''
-}
-
 export async function registerHorasTurno(params: {
   turn: Turn
   userName: string
@@ -367,32 +355,17 @@ export async function registerHorasTurno(params: {
   const checkOut = turn.attendance?.checkOut?.markedAt
   if (!checkIn) return null
 
-  let horasTrabajadas = 0
-  if (checkIn && checkOut) {
-    const diff = new Date(checkOut).getTime() - new Date(checkIn).getTime()
-    horasTrabajadas = diff > 0 ? Math.round((diff / 3_600_000) * 100) / 100 : 0
-  }
-
-  const diaSemana = getDiaSemana(turn.fecha)
-  const esDominical = diaSemana === 'domingo'
-  const esFestivo = festivosColombia2026.has(turn.fecha)
-
-  let horasOrdinarias = 0, horasDominicales = 0, horasFestivas = 0
-  if (esFestivo) horasFestivas = horasTrabajadas
-  else if (esDominical) horasDominicales = horasTrabajadas
-  else horasOrdinarias = horasTrabajadas
-
-  // Horas nocturnas (informativas + recargo) y extras sobre la jornada ordinaria
-  const horasNocturnas = checkIn && checkOut
-    ? nightHoursBetween(new Date(checkIn).getTime(), new Date(checkOut).getTime(), timezone, params.nocturnoInicioHora ?? 19, params.nocturnoFinHora ?? 6)
-    : 0
-  const horasExtra = Math.max(0, Math.round((horasTrabajadas - jornadaOrdinaria) * 100) / 100)
-  const subtotalNocturno = valorHora ? Math.round(horasNocturnas * valorHora * (recargoNocturno / 100) * 100) / 100 : undefined
-
-  const subtotalOrdinario = valorHora ? Math.round(horasOrdinarias * valorHora * 100) / 100 : undefined
-  const subtotalDominical = valorHora ? Math.round(horasDominicales * valorHora * (1 + recargoDominical / 100) * 100) / 100 : undefined
-  const subtotalFestivo = valorHora ? Math.round(horasFestivas * valorHora * (1 + recargoFestivo / 100) * 100) / 100 : undefined
-  const subtotal = valorHora ? (subtotalOrdinario ?? 0) + (subtotalDominical ?? 0) + (subtotalFestivo ?? 0) + (subtotalNocturno ?? 0) : undefined
+  // Cálculo puro (probado en hours.test.ts)
+  const {
+    diaSemana, esDominical, esFestivo,
+    horasTrabajadas, horasOrdinarias, horasDominicales, horasFestivas,
+    horasNocturnas, horasExtra,
+    subtotalOrdinario, subtotalDominical, subtotalFestivo, subtotalNocturno, subtotal,
+  } = computeHours({
+    fecha: turn.fecha, checkIn, checkOut, valorHora,
+    recargoDominical, recargoFestivo, recargoNocturno, jornadaOrdinaria, timezone,
+    nocturnoInicioHora: params.nocturnoInicioHora, nocturnoFinHora: params.nocturnoFinHora,
+  })
 
   const fmtTime = (iso: string | undefined) => {
     if (!iso) return undefined

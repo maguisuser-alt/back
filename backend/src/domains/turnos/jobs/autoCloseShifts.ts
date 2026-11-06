@@ -8,6 +8,7 @@
  */
 import { registerHorasTurno, updateClassSession, updateTurn, upsertStudentAttendance } from '../lib/database.js'
 import { zonedTimeToMs } from '../lib/geo.js'
+import { turnRangeMs } from '../lib/shift-time.js'
 import {
   getAcademicGroupsCollection,
   getClassSessionsCollection,
@@ -21,17 +22,6 @@ import type { AttendanceRecord, ClassSession, Company, Turn, User } from '../typ
 
 const DEFAULT_GRACE_MINUTES = 120  // 2 horas después de horaFin
 const DEFAULT_TIMEZONE = 'America/Bogota'
-
-/** Inicio y fin (ms UTC) de un turno en la zona horaria dada; soporta turnos nocturnos. */
-function turnRangeMs(turn: Turn, timezone: string): { startMs: number; endMs: number } | null {
-  if (!turn.horaFin || !turn.fecha || !turn.hora) return null
-  const [eh, em] = turn.horaFin.split(':').map(Number)
-  if (Number.isNaN(eh) || Number.isNaN(em)) return null
-  const startMs = zonedTimeToMs(turn.fecha, turn.hora, timezone)
-  let endMs = zonedTimeToMs(turn.fecha, turn.horaFin, timezone)
-  if (endMs <= startMs) endMs += 24 * 3_600_000 // nocturno
-  return { startMs, endMs }
-}
 
 function buildAutoCheckOut(turn: Turn, endMs: number): AttendanceRecord {
   const iso = new Date(endMs).toISOString()

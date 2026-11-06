@@ -11,6 +11,7 @@ import { Router } from 'express'
 import { createFaceVerificationLog, readDatabase, readLocalUser, updateTurn, updateUser, updateUserLocal, uploadFacialPhoto } from '../lib/database.js'
 import { registerFace, verifyFace } from '../lib/face-recognition.js'
 import { zonedTimeToMs } from '../lib/geo.js'
+import { resolveExitTime } from '../lib/shift-time.js'
 import { getCompaniesCollection, getLocationsCollection, getTurnsCollection } from '../lib/mongodb.js'
 import { requireAuth } from '../middleware/auth.js'
 import type {
@@ -155,24 +156,6 @@ function findAssignedTurn(
         item.assignedToUserId === userId,
     ) ?? null
   )
-}
-
-/** Antigüedad máxima aceptada para una salida marcada sin conexión. */
-const MAX_OFFLINE_EXIT_AGE_MS = 72 * 3_600_000
-
-/**
- * Hora de la salida. Normalmente es "ahora". Si viene de la cola sin conexión se acepta la hora
- * real del cliente, pero acotada: nunca en el futuro (no se pueden inflar horas), nunca antes de
- * la entrada y nunca de hace más de 72 h. Si no cumple, se usa "ahora".
- */
-function resolveExitTime(clientMarkedAt: string | undefined, offlineQueued: boolean | undefined, checkInAt: string | undefined): string {
-  const now = Date.now()
-  if (!offlineQueued || !clientMarkedAt) return new Date(now).toISOString()
-  const ms = Date.parse(clientMarkedAt)
-  if (Number.isNaN(ms)) return new Date(now).toISOString()
-  const checkInMs = checkInAt ? Date.parse(checkInAt) : Number.NEGATIVE_INFINITY
-  if (ms > now || ms < checkInMs || now - ms > MAX_OFFLINE_EXIT_AGE_MS) return new Date(now).toISOString()
-  return new Date(ms).toISOString()
 }
 
 attendanceRouter.use(requireAuth)
