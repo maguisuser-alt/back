@@ -29,6 +29,7 @@ import { isWhatsAppTurnosEnabled, resumeSavedSessions, reconnectDroppedSessions 
 import { connectMongo, ensureTurnosIndexes } from './lib/mongodb.js'
 import { runAutoCloseShifts } from './jobs/autoCloseShifts.js'
 import { runTurnReminders } from './jobs/sendTurnReminders.js'
+import { CLEANUP_INTERVAL_MS, runCleanup } from './jobs/cleanup.js'
 
 export const turnosRouter = Router()
 
@@ -108,6 +109,9 @@ export async function initTurnos(): Promise<void> {
   startWhatsAppMaintenance()
   void runAutoCloseShifts().catch(() => {})
   setInterval(() => { void runAutoCloseShifts().catch(() => {}) }, AUTO_CLOSE_INTERVAL_MS)
+  // Limpieza diaria de datos de bajo valor (retraso inicial para no competir con el arranque)
+  setTimeout(() => { void runCleanup().catch(() => {}) }, 5 * 60 * 1000)
+  setInterval(() => { void runCleanup().catch(() => {}) }, CLEANUP_INTERVAL_MS)
   // Recordatorios de turno por WhatsApp (no hace nada si el canal está apagado)
   setInterval(() => { void runTurnReminders().catch((e) => console.warn('[recordatorios]', e instanceof Error ? e.message : e)) }, REMINDER_INTERVAL_MS)
 }

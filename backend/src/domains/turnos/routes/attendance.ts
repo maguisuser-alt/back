@@ -157,6 +157,24 @@ function findAssignedTurn(
   )
 }
 
+/** Antigüedad máxima aceptada para una salida marcada sin conexión. */
+const MAX_OFFLINE_EXIT_AGE_MS = 72 * 3_600_000
+
+/**
+ * Hora de la salida. Normalmente es "ahora". Si viene de la cola sin conexión se acepta la hora
+ * real del cliente, pero acotada: nunca en el futuro (no se pueden inflar horas), nunca antes de
+ * la entrada y nunca de hace más de 72 h. Si no cumple, se usa "ahora".
+ */
+function resolveExitTime(clientMarkedAt: string | undefined, offlineQueued: boolean | undefined, checkInAt: string | undefined): string {
+  const now = Date.now()
+  if (!offlineQueued || !clientMarkedAt) return new Date(now).toISOString()
+  const ms = Date.parse(clientMarkedAt)
+  if (Number.isNaN(ms)) return new Date(now).toISOString()
+  const checkInMs = checkInAt ? Date.parse(checkInAt) : Number.NEGATIVE_INFINITY
+  if (ms > now || ms < checkInMs || now - ms > MAX_OFFLINE_EXIT_AGE_MS) return new Date(now).toISOString()
+  return new Date(ms).toISOString()
+}
+
 attendanceRouter.use(requireAuth)
 
 attendanceRouter.get('/biometric-status', async (request, response) => {
@@ -602,13 +620,17 @@ attendanceRouter.post('/verify-authentication', async (request, response) => {
  * - SALIDA: no requiere validación de ubicación (el empleado puede estar en tránsito).
  */
 attendanceRouter.post('/mark', async (request, response) => {
-  const { turnId, action, latitude, longitude, photoBase64, photoMimeType } = request.body as {
+  const { turnId, action, latitude, longitude, photoBase64, photoMimeType, clientMarkedAt, offlineQueued } = request.body as {
     turnId?: string
     action?: string
     latitude?: number
     longitude?: number
     photoBase64?: string
     photoMimeType?: string
+    /** Hora real en que el usuario marcó la salida sin conexión (ISO). Solo aplica a salida. */
+    clientMarkedAt?: string
+    /** true cuando la petición viene de la cola local de marcajes sin conexión. */
+    offlineQueued?: boolean
   }
 
   const parsedAction = parseAttendanceAction(action)
@@ -654,6 +676,13 @@ attendanceRouter.post('/mark', async (request, response) => {
 
   if (parsedAction === 'salida' && !turn.attendance?.checkIn) {
     response.status(400).json({ message: 'Primero debes registrar la entrada del turno.' })
+    return
+  }
+
+  // Idempotencia para la cola sin conexión: si la salida ya quedó registrada (p. ej. se perdió
+  // la respuesta del primer intento), se responde OK sin sobrescribir la hora original.
+  if (parsedAction === 'salida' && offlineQueued && turn.attendance?.checkOut) {
+    response.json({ verified: true, action: parsedAction, turn, attendance: turn.attendance.checkOut })
     return
   }
 
@@ -749,7 +778,7 @@ attendanceRouter.post('/mark', async (request, response) => {
   // SALIDA: se registra con la hora real del momento
   const markedAt = parsedAction === 'entrada'
     ? new Date(zonedTimeToMs(turn.fecha, turn.hora, tz)).toISOString()
-    : new Date().toISOString()
+    : resolveExitTime(clientMarkedAt, offlineQueued, turn.attendance?.checkIn?.markedAt)
 
   const attendanceRecord: AttendanceRecord = {
     action: parsedAction,
