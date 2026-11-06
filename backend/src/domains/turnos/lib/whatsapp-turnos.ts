@@ -147,8 +147,9 @@ export async function sendAlbum(
   caption?: string,
   companyId?: string,
   userId?: string,
-  /** Dónde va el caption global: en la primera foto (por defecto) o en la última. */
-  captionPosition: 'first' | 'last' = 'first',
+  /** Dónde va el caption global: primera foto (por defecto), última, o como
+   *  mensaje de texto después de las fotos ('after'). */
+  captionPosition: 'first' | 'last' | 'after' = 'first',
   /** Álbum nativo (una burbuja con cuadrícula). Solo lo pide trazabilidad. */
   nativeAlbum = false,
 ): Promise<{ id: string | null; count: number }> {
@@ -191,7 +192,9 @@ export async function sendAlbum(
 
   let firstId: string | null = null
   let count = 0
-  const captionIdx = captionPosition === 'last' ? images.length - 1 : 0
+  // 'after': ninguna foto lleva el texto global (para que WhatsApp las agrupe
+  // en cuadrícula) y el texto se manda como mensaje justo después.
+  const captionIdx = captionPosition === 'after' ? -1 : captionPosition === 'last' ? images.length - 1 : 0
 
   for (let i = 0; i < images.length; i++) {
     const it = images[i]
@@ -212,6 +215,16 @@ export async function sendAlbum(
     // Pequeña pausa para no saturar y permitir que WhatsApp agrupe.
     if (i < images.length - 1) {
       await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+
+  // 'after': el texto justo debajo del grupo de fotos.
+  if (captionPosition === 'after' && caption && count > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    try {
+      await manager.sendContent(companyId, userId, to, { text: caption })
+    } catch (err) {
+      console.error('[whatsapp:turnos] No se pudo enviar el texto del álbum:', err)
     }
   }
 

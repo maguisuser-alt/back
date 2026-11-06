@@ -290,31 +290,21 @@ export async function sendAlbum(
   //    como "N mensajes no leídos") pero NO renderiza las imágenes del álbum.
   //    Enviar imágenes normales en secuencia es fiable y WhatsApp las agrupa
   //    visualmente por sí mismo cuando llegan seguidas.
+  //    Las fotos van TODAS sin texto: WhatsApp deja fuera de la cuadrícula las
+  //    fotos que llevan texto, así que una sola foto con texto quedaba suelta
+  //    (y con 4 fotos ya no alcanzaban para formar la cuadrícula). El texto se
+  //    manda justo después, como mensaje, para que quede debajo del grupo.
   let firstId: string | null = null
   let count = 0
-  let captionSent = false
   for (let i = 0; i < buffers.length; i++) {
-    // El caption va en la ÚLTIMA imagen: WhatsApp agrupa en cuadrícula las
-    // imágenes seguidas sin texto y muestra el texto debajo del grupo, como un
-    // álbum. Con el texto en la primera, esa foto queda suelta.
-    const isLast = i === buffers.length - 1
-    // La última foto lleva el texto: si falla se reintenta una vez antes de
-    // dar el texto por perdido, para que el grupo y el texto queden juntos.
-    const attempts = isLast && caption ? 2 : 1
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
-          image: buffers[i],
-          ...(isLast && caption ? { caption } : {}),
-        })
-        if (count === 0) firstId = res?.key?.id ?? null
-        if (isLast && caption) captionSent = true
-        count++
-        break
-      } catch (err) {
-        console.error(`[whatsapp:trazabilidad] Fallo al enviar imagen ${i} del grupo (intento ${attempt}/${attempts}):`, err)
-        if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 1500))
-      }
+    try {
+      const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
+        image: buffers[i],
+      })
+      if (count === 0) firstId = res?.key?.id ?? null
+      count++
+    } catch (err) {
+      console.error(`[whatsapp:trazabilidad] Fallo al enviar imagen ${i} del grupo:`, err)
     }
     // Pausa breve entre imágenes: suficiente para que WhatsApp las agrupe sin
     // saturar la conexión.
@@ -326,9 +316,9 @@ export async function sendAlbum(
   // Si no se pudo enviar NINGUNA imagen (p. ej. conexión caída a mitad), es un
   // fallo real: no lo reportes como éxito con 0 fotos.
   if (count === 0) throw new Error('No se pudo enviar ninguna foto del grupo. Revisa la conexión de WhatsApp.')
-  // Si la última foto falló, el texto no salió: se manda como mensaje aparte
-  // para no perderlo.
-  if (caption && !captionSent) {
+  // Texto inmediatamente después del grupo de fotos.
+  if (caption) {
+    await new Promise((resolve) => setTimeout(resolve, 400))
     try {
       await manager.sendContent(companyId, userId, to, { text: caption })
     } catch (err) {
