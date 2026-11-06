@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { Router } from 'express'
 import { hashPassword, signToken } from '../lib/auth.js'
 import { deleteCompany } from '../lib/database.js'
@@ -42,9 +43,22 @@ async function syncTracerFeatures(companyId: string, settings: {
   }
 }
 
-// ── Credenciales root hardcoded ─────────────────────────────────────────────
-const ROOT_USERNAME = 'root'
-const ROOT_PASSWORD = '1192920673J'
+// ── Credenciales root ───────────────────────────────────────────────────────
+// Se leen de ROOT_USERNAME / ROOT_PASSWORD (Render → Environment).
+// TRANSICIÓN: si ROOT_PASSWORD no está definida se usa el valor histórico para no
+// cortar el acceso; en cuanto la definas, el valor del código deja de usarse.
+const ROOT_USERNAME = process.env.ROOT_USERNAME || 'root'
+const ROOT_PASSWORD = process.env.ROOT_PASSWORD || '1192920673J'
+if (!process.env.ROOT_PASSWORD) {
+  console.warn('[turnos/root] ROOT_PASSWORD no está definida: se usa la contraseña histórica del código. Defínela en Render y rótala.')
+}
+
+/** Comparación en tiempo constante para no filtrar información por tiempos de respuesta. */
+function safeEqual(a: string, b: string): boolean {
+  const ha = createHash('sha256').update(a).digest()
+  const hb = createHash('sha256').update(b).digest()
+  return timingSafeEqual(ha, hb)
+}
 
 // ── POST /api/root/login ────────────────────────────────────────────────────
 rootRouter.post('/login', (request, response) => {
@@ -55,7 +69,7 @@ rootRouter.post('/login', (request, response) => {
     return
   }
 
-  if (username !== ROOT_USERNAME || password !== ROOT_PASSWORD) {
+  if (!safeEqual(username, ROOT_USERNAME) || !safeEqual(password, ROOT_PASSWORD)) {
     response.status(401).json({ message: 'Credenciales root inválidas.' })
     return
   }

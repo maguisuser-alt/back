@@ -1,11 +1,19 @@
 import { Router } from 'express'
 import { resolveCompanyIdForUser } from '../lib/access.js'
 import { createTurn, deleteTurn, readDatabase, updateTurn } from '../lib/database.js'
-import { getHorasTurnoCollection, getTurnsCollection } from '../lib/mongodb.js'
+import { getHorasTurnoCollection, getLocationsCollection, getTurnsCollection, getUsersCollection } from '../lib/mongodb.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
-import type { TurnStatus } from '../types.js'
+import type { Turn, TurnStatus, User } from '../types.js'
 
 export const turnsRouter = Router()
+
+/** Usuario actual (solo los campos necesarios) con una consulta puntual. */
+async function getCurrentUserDoc(userId: string): Promise<Pick<User, 'id' | 'companyId' | 'cargo'> | null> {
+  return (await (await getUsersCollection()).findOne(
+    { id: userId } as any,
+    { projection: { _id: 0, id: 1, companyId: 1, cargo: 1 } },
+  )) as Pick<User, 'id' | 'companyId' | 'cargo'> | null
+}
 
 /** Calcula el deadline de confirmación: hora del turno - N horas (default 4). */
 function buildConfirmedDeadline(fecha: string, hora: string, hoursLimit = 4): string {
@@ -17,37 +25,48 @@ function buildConfirmedDeadline(fecha: string, hora: string, hoursLimit = 4): st
 turnsRouter.use(requireAuth)
 
 turnsRouter.get('/', async (request, response) => {
-  const db = await readDatabase()
   const { fecha, estado, assignedToUserId, locationId } = request.query
-  const currentUser = db.users.find((item) => item.id === request.authUser!.userId)
-  const companyId = resolveCompanyIdForUser(db, currentUser)
   const role = request.authUser!.role
   const userId = request.authUser!.userId
+  const currentUser = await getCurrentUserDoc(userId)
+  const companyId = currentUser?.companyId ?? ''
+  if (!companyId) { response.json([]); return }
 
   // Detecta supervisor por rol exacto O por cargo que contenga "supervisor"
   const isSupervisor = role === 'supervisor'
     || (role !== 'admin' && currentUser?.cargo?.toLowerCase().includes('supervisor'))
 
-  const turns = db.turns.filter((turn) => {
-    if (turn.companyId !== companyId) return false
+  // Los filtros se aplican en Mongo (no se carga toda la base en memoria)
+  const filter: Record<string, unknown> = { companyId }
 
-    // Operativo puro (sin cargo supervisor): solo sus propios turnos
-    if (!isSupervisor && role === 'operativo' && turn.assignedToUserId !== userId) return false
+  // Operativo puro (sin cargo supervisor): solo sus propios turnos.
+  // Supervisor y admin ven todos los de la empresa (el front filtra según contexto).
+  if (!isSupervisor && role === 'operativo') filter.assignedToUserId = userId
 
-    // Supervisor y admin: ven todos los turnos de la empresa
-    // (el frontend filtra lo que muestra según el contexto)
+  if (typeof fecha === 'string' && fecha) filter.fecha = fecha
+  if (typeof estado === 'string' && estado) filter.estado = estado
+  if (typeof locationId === 'string' && locationId) filter.locationId = locationId
+  if (typeof assignedToUserId === 'string' && assignedToUserId) {
+    // Un operativo no puede ver turnos de otros aunque lo pida por query
+    if (filter.assignedToUserId && filter.assignedToUserId !== assignedToUserId) { response.json([]); return }
+    filter.assignedToUserId = assignedToUserId
+  }
 
-    if (typeof fecha === 'string' && fecha && turn.fecha !== fecha) return false
-    if (typeof estado === 'string' && estado && turn.estado !== estado) return false
-    if (typeof assignedToUserId === 'string' && assignedToUserId && turn.assignedToUserId !== assignedToUserId) return false
-    if (typeof locationId === 'string' && locationId && turn.locationId !== locationId) return false
+  const turns = (await (await getTurnsCollection()).find(filter as any).project({ _id: 0 }).toArray()) as unknown as Turn[]
 
-    return true
-  })
-
-  // Enriquece los turnos con nombre de ubicación y nombre del asignado
-  const usersById = new Map(db.users.map((u) => [u.id, u]))
-  const locationsById = new Map(db.locations.map((l) => [l.id, l]))
+  // Enriquece solo con los usuarios y ubicaciones que realmente aparecen en estos turnos
+  const needUserIds = [...new Set(turns.filter((t) => !t.assignedToUserName && t.assignedToUserId).map((t) => t.assignedToUserId as string))]
+  const needLocIds = [...new Set(turns.filter((t) => !t.locationNombre && t.locationId).map((t) => t.locationId as string))]
+  const [users, locations] = await Promise.all([
+    needUserIds.length
+      ? ((await getUsersCollection()).find({ id: { $in: needUserIds } } as any).project({ _id: 0, id: 1, nombreCompleto: 1 }).toArray() as unknown as Promise<Array<Pick<User, 'id' | 'nombreCompleto'>>>)
+      : Promise.resolve([]),
+    needLocIds.length
+      ? ((await getLocationsCollection()).find({ id: { $in: needLocIds } } as any).project({ _id: 0, id: 1, nombre: 1 }).toArray() as unknown as Promise<Array<{ id: string; nombre: string }>>)
+      : Promise.resolve([]),
+  ])
+  const usersById = new Map(users.map((u) => [u.id, u]))
+  const locationsById = new Map(locations.map((l) => [l.id, l]))
   const enriched = turns.map((t) => ({
     ...t,
     assignedToUserName: t.assignedToUserName ?? (t.assignedToUserId ? usersById.get(t.assignedToUserId)?.nombreCompleto : undefined),
@@ -519,9 +538,9 @@ turnsRouter.delete('/:turnId', async (request, response) => {
 turnsRouter.get('/hours-history', requireRole(['admin', 'supervisor']), async (request, response) => {
   const { from, to, userId } = request.query as { from?: string; to?: string; userId?: string }
 
-  const db = await readDatabase()
-  const currentUser = db.users.find((u) => u.id === request.authUser!.userId)
-  const companyId = resolveCompanyIdForUser(db, currentUser)
+  // Solo se necesita la empresa del usuario: consulta puntual en vez de cargar toda la base
+  const currentUser = await getCurrentUserDoc(request.authUser!.userId)
+  const companyId = currentUser?.companyId ?? ''
 
   const col = await getHorasTurnoCollection()
 
@@ -541,15 +560,21 @@ turnsRouter.get('/hours-history', requireRole(['admin', 'supervisor']), async (r
   const totalOrdinarias = records.reduce((s, r) => s + (r.horasOrdinarias ?? 0), 0)
   const totalDominicales = records.reduce((s, r) => s + (r.horasDominicales ?? 0), 0)
   const totalFestivas = records.reduce((s, r) => s + (r.horasFestivas ?? 0), 0)
+  // Los registros anteriores a esta versión no traen estos campos: cuentan como 0
+  const totalNocturnas = records.reduce((s, r) => s + (r.horasNocturnas ?? 0), 0)
+  const totalExtra = records.reduce((s, r) => s + (r.horasExtra ?? 0), 0)
+  const round2 = (n: number) => Math.round(n * 100) / 100
 
   response.json({
     records,
     summary: {
       total: records.length,
-      totalHoras: Math.round(totalHoras * 100) / 100,
-      totalOrdinarias: Math.round(totalOrdinarias * 100) / 100,
-      totalDominicales: Math.round(totalDominicales * 100) / 100,
-      totalFestivas: Math.round(totalFestivas * 100) / 100,
+      totalHoras: round2(totalHoras),
+      totalOrdinarias: round2(totalOrdinarias),
+      totalDominicales: round2(totalDominicales),
+      totalFestivas: round2(totalFestivas),
+      totalNocturnas: round2(totalNocturnas),
+      totalExtra: round2(totalExtra),
     },
   })
 })

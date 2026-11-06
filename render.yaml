@@ -44,6 +44,14 @@ services:
       - key: AUTH_TOKEN_SECRET
         sync: false
 
+      # ── Acceso root (panel de administración global) ──
+      # Define ambas en Render → Environment. Si ROOT_PASSWORD falta, el backend
+      # usa la contraseña histórica del código (hay que rotarla).
+      - key: ROOT_USERNAME
+        sync: false
+      - key: ROOT_PASSWORD
+        sync: false
+
       # ── WhatsApp (Baileys). Requiere proceso siempre activo. ──
       - key: ENABLE_WHATSAPP_TURNOS
         value: "true"
