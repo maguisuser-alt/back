@@ -195,6 +195,54 @@ export async function sendDocument(
 }
 
 /**
+ * Álbum NATIVO de WhatsApp: primero un mensaje `albumMessage` con el número de
+ * fotos esperado, y luego cada foto asociada a él (`albumParentKey` →
+ * messageAssociation MEDIA_ALBUM). WhatsApp lo muestra como UNA burbuja con
+ * cuadrícula y el texto debajo.
+ *
+ * Devuelve null si el mensaje padre falla (no se envió nada → el llamador usa
+ * el envío secuencial). Si alguna foto falla después, NO se reenvía en modo
+ * secuencial para no duplicar fotos: se devuelve lo que sí salió.
+ */
+async function sendNativeAlbum(
+  to: string,
+  buffers: Buffer[],
+  caption: string | undefined,
+  companyId?: string,
+  userId?: string,
+): Promise<{ id: string | null; count: number } | null> {
+  let parentKey: { id?: string | null } | undefined
+  try {
+    const parent = await manager.sendContent<{ key: { id?: string | null } }>(companyId, userId, to, {
+      album: { expectedImageCount: buffers.length },
+    })
+    parentKey = parent?.key
+  } catch (err) {
+    console.error('[whatsapp:trazabilidad] Álbum nativo: falló el mensaje padre, se usa envío secuencial:', err)
+    return null
+  }
+  if (!parentKey) return null
+
+  let count = 0
+  for (let i = 0; i < buffers.length; i++) {
+    try {
+      await manager.sendContent(companyId, userId, to, {
+        image: buffers[i],
+        albumParentKey: parentKey,
+        // El texto en la primera foto del álbum: WhatsApp lo muestra bajo la cuadrícula.
+        ...(i === 0 && caption ? { caption } : {}),
+      })
+      count++
+    } catch (err) {
+      console.error(`[whatsapp:trazabilidad] Álbum nativo: fallo al enviar la foto ${i}:`, err)
+    }
+    if (i < buffers.length - 1) await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  if (count === 0) throw new Error('No se pudo enviar ninguna foto del álbum. Revisa la conexión de WhatsApp.')
+  return { id: parentKey.id ?? null, count }
+}
+
+/**
  * Envía varias imágenes como un ÁLBUM (agrupadas, como una galería en WhatsApp)
  * con un único texto (caption) que aparece una sola vez al final del grupo.
  *
@@ -227,6 +275,14 @@ export async function sendAlbum(
     }
   }
   if (buffers.length === 0) return { id: null, count: 0 }
+
+  // 1b. Álbum NATIVO (opcional, WHATSAPP_NATIVE_ALBUM=true): una sola burbuja
+  //     con cuadrícula 2x2, "+N" y el texto debajo. Si el mensaje padre no se
+  //     puede enviar, no se envió nada y se sigue con el envío secuencial.
+  if (process.env.WHATSAPP_NATIVE_ALBUM === 'true' && buffers.length >= 2) {
+    const native = await sendNativeAlbum(to, buffers, caption, companyId, userId)
+    if (native) return native
+  }
 
   // 2. Envío SECUENCIAL: cada imagen como un mensaje de imagen independiente.
   //    NO se usa el "álbum nativo" de Baileys (expectedImageCount +

@@ -149,8 +149,45 @@ export async function sendAlbum(
   userId?: string,
   /** Dónde va el caption global: en la primera foto (por defecto) o en la última. */
   captionPosition: 'first' | 'last' = 'first',
+  /** Álbum nativo (una burbuja con cuadrícula). Solo lo pide trazabilidad. */
+  nativeAlbum = false,
 ): Promise<{ id: string | null; count: number }> {
   if (images.length === 0) return { id: null, count: 0 }
+
+  // Álbum NATIVO: mensaje padre + fotos asociadas. Si el padre falla no se
+  // envió nada y se sigue con el envío foto a foto de siempre.
+  if (nativeAlbum && images.length >= 2) {
+    let parentKey: { id?: string | null } | undefined
+    try {
+      const parent = await manager.sendContent<{ key: { id?: string | null } }>(companyId, userId, to, {
+        album: { expectedImageCount: images.length },
+      })
+      parentKey = parent?.key
+    } catch (err) {
+      console.error('[whatsapp:turnos] Álbum nativo: falló el mensaje padre, se usa envío secuencial:', err)
+    }
+    if (parentKey) {
+      let sentCount = 0
+      for (let i = 0; i < images.length; i++) {
+        const it = images[i]
+        const img = typeof it.image === 'string' ? { url: it.image } : it.image
+        const cap = it.caption ?? (i === 0 ? caption : undefined)
+        try {
+          await manager.sendContent(companyId, userId, to, {
+            image: img,
+            albumParentKey: parentKey,
+            ...(cap ? { caption: cap } : {}),
+          })
+          sentCount++
+        } catch (err) {
+          console.error(`[whatsapp:turnos] Álbum nativo: fallo al enviar la foto ${i}:`, err)
+        }
+        if (i < images.length - 1) await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+      if (sentCount === 0) throw new Error('No se pudo enviar ninguna foto del álbum.')
+      return { id: parentKey.id ?? null, count: sentCount }
+    }
+  }
 
   let firstId: string | null = null
   let count = 0
