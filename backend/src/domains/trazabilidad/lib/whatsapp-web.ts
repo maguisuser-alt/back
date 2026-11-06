@@ -242,16 +242,23 @@ export async function sendAlbum(
     // imágenes seguidas sin texto y muestra el texto debajo del grupo, como un
     // álbum. Con el texto en la primera, esa foto queda suelta.
     const isLast = i === buffers.length - 1
-    try {
-      const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
-        image: buffers[i],
-        ...(isLast && caption ? { caption } : {}),
-      })
-      if (count === 0) firstId = res?.key?.id ?? null
-      if (isLast && caption) captionSent = true
-      count++
-    } catch (err) {
-      console.error(`[whatsapp:trazabilidad] Fallo al enviar imagen ${i} del grupo:`, err)
+    // La última foto lleva el texto: si falla se reintenta una vez antes de
+    // dar el texto por perdido, para que el grupo y el texto queden juntos.
+    const attempts = isLast && caption ? 2 : 1
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
+          image: buffers[i],
+          ...(isLast && caption ? { caption } : {}),
+        })
+        if (count === 0) firstId = res?.key?.id ?? null
+        if (isLast && caption) captionSent = true
+        count++
+        break
+      } catch (err) {
+        console.error(`[whatsapp:trazabilidad] Fallo al enviar imagen ${i} del grupo (intento ${attempt}/${attempts}):`, err)
+        if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 1500))
+      }
     }
     // Pausa breve entre imágenes: suficiente para que WhatsApp las agrupe sin
     // saturar la conexión.
