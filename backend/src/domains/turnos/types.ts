@@ -506,6 +506,7 @@ export type CompanySettings = {
   jornadaOrdinaria?: number            // Horas jornada ordinaria (default 8)
   permitirTeletrabajo?: boolean        // Habilita fichaje remoto
   permitirPermutaTurnos?: boolean      // Permite cambio de turnos entre empleados
+  recordatorioMinutosAntes?: number    // Minutos antes del inicio para avisar por WhatsApp (default 60)
   autoCloseGraceMinutes?: number       // Minutos tras horaFin para autocerrar un turno sin salida (default 120)
   nocturnoInicioHora?: number          // Hora local en que inicia el horario nocturno (default 19)
   nocturnoFinHora?: number             // Hora local en que termina el horario nocturno (default 6)
@@ -640,6 +641,7 @@ export type Turn = {
   confirmedByUserId?: string          // Supervisor que confirmó
   confirmedByUserName?: string
   confirmedAt?: string                // Fecha/hora de confirmación
+  reminderSentAt?: string             // Cuándo se envió el recordatorio por WhatsApp (evita duplicados)
   novedades?: TurnNovedad[]           // Reportes de novedades del supervisor
   attendance?: TurnAttendance
   createdAt: string

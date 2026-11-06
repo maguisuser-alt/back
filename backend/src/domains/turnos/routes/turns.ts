@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { resolveCompanyIdForUser } from '../lib/access.js'
 import { createTurn, deleteTurn, readDatabase, updateTurn } from '../lib/database.js'
-import { getHorasTurnoCollection } from '../lib/mongodb.js'
+import { getHorasTurnoCollection, getTurnsCollection } from '../lib/mongodb.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import type { TurnStatus } from '../types.js'
 
@@ -178,7 +178,13 @@ turnsRouter.patch('/:turnId', async (request, response) => {
   }
 
   turn.updatedAt = new Date().toISOString()
+  // Si cambió el horario, el recordatorio de WhatsApp debe reenviarse con la hora nueva
+  const horarioCambio = Boolean(fecha || hora)
+  if (horarioCambio) delete turn.reminderSentAt
   await updateTurn(turn)
+  if (horarioCambio) {
+    await (await getTurnsCollection()).updateOne({ id: turn.id } as any, { $unset: { reminderSentAt: '' } } as any)
+  }
 
   response.json(turn)
 })
