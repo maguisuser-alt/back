@@ -165,8 +165,8 @@ async function uSendAlbum(to: string, urls: string[], caption?: string, companyI
       caption,
       // Fotos sin texto (para que se agrupen) y el texto justo después.
       captionPosition: 'after',
-      // Mismo interruptor que el envío propio: álbum nativo solo si está activo.
-      nativeAlbum: process.env.WHATSAPP_NATIVE_ALBUM === 'true',
+      // Mismo interruptor que el envío propio: álbum nativo salvo WHATSAPP_NATIVE_ALBUM=false.
+      nativeAlbum: process.env.WHATSAPP_NATIVE_ALBUM !== 'false',
       companyId,
       userId,
     })

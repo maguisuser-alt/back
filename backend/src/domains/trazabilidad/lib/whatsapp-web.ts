@@ -276,10 +276,12 @@ export async function sendAlbum(
   }
   if (buffers.length === 0) return { id: null, count: 0 }
 
-  // 1b. Álbum NATIVO (opcional, WHATSAPP_NATIVE_ALBUM=true): una sola burbuja
+  // 1b. Álbum NATIVO: una sola burbuja
   //     con cuadrícula 2x2, "+N" y el texto debajo. Si el mensaje padre no se
   //     puede enviar, no se envió nada y se sigue con el envío secuencial.
-  if (process.env.WHATSAPP_NATIVE_ALBUM === 'true' && buffers.length >= 2) {
+  // Activo por defecto. WHATSAPP_NATIVE_ALBUM=false lo apaga (vuelve al envío
+  // foto a foto con el texto después).
+  if (process.env.WHATSAPP_NATIVE_ALBUM !== 'false' && buffers.length >= 2) {
     const native = await sendNativeAlbum(to, buffers, caption, companyId, userId)
     if (native) return native
   }
