@@ -79,6 +79,7 @@ export async function ensureTurnosIndexes(): Promise<void> {
     horas.createIndex({ userId: 1, fecha: 1 }),
     users.createIndex({ companyId: 1 }),
     invitations.createIndex({ status: 1, expiresAt: 1 }),
+    coreDb(DOMAIN).then((db) => db.collection('turnSwaps').createIndex({ companyId: 1, estado: 1, createdAt: -1 })),
   ])
 }
 

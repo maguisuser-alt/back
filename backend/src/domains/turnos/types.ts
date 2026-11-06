@@ -648,6 +648,31 @@ export type Turn = {
   updatedAt: string
 }
 
+/** Estados de una permuta: propuesta → aceptada por el compañero → aprobada por supervisor. */
+export type TurnSwapStatus = 'pendiente_companero' | 'pendiente_aprobacion' | 'aprobada' | 'rechazada' | 'cancelada'
+
+export type TurnSwap = {
+  id: string
+  companyId: string
+  /** Turno que cede quien propone. */
+  turnId: string
+  requesterUserId: string
+  requesterUserName: string
+  /** Turno del compañero que se recibe a cambio. */
+  targetTurnId: string
+  targetUserId: string
+  targetUserName: string
+  motivo?: string
+  estado: TurnSwapStatus
+  respondedAt?: string
+  resolvedByUserId?: string
+  resolvedByUserName?: string
+  resolvedAt?: string
+  rejectionReason?: string
+  createdAt: string
+  updatedAt: string
+}
+
 export type UserInvitation = {
   id: string
   token: string

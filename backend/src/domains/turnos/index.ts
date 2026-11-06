@@ -21,6 +21,7 @@ import { positionsRouter } from './routes/positions.js'
 import { settingsRouter } from './routes/settings.js'
 import { usersRouter } from './routes/users.js'
 import { turnsRouter } from './routes/turns.js'
+import { swapsRouter } from './routes/swaps.js'
 import { whatsappTurnosRouter } from './routes/whatsapp-turnos.js'
 import { whatsappConfigRouter } from './routes/whatsapp-config.js'
 import { isWhatsAppTurnosEnabled, resumeSavedSessions, reconnectDroppedSessions } from './lib/whatsapp-turnos.js'
@@ -65,6 +66,7 @@ turnosRouter.use('/api/positions', positionsRouter)
 turnosRouter.use('/api/settings', settingsRouter)
 turnosRouter.use('/api/users', usersRouter)
 turnosRouter.use('/api/turns', turnsRouter)
+turnosRouter.use('/api/swaps', swapsRouter)
 
 // WhatsApp de Turnos: solo se monta si está habilitado por configuración.
 if (isWhatsAppTurnosEnabled()) {
