@@ -149,7 +149,7 @@ whatsappTurnosRouter.post('/send-image', async (req, res) => {
 })
 
 whatsappTurnosRouter.post('/send-album', async (req, res) => {
-  const { to, images, caption, companyId } = req.body ?? {}
+  const { to, images, caption, companyId, captionPosition } = req.body ?? {}
   const userId = reqUserId(req)
   if (!to) { res.status(400).json({ message: 'El destino "to" es requerido.' }); return }
   if (!Array.isArray(images) || images.length === 0) {
@@ -160,7 +160,7 @@ whatsappTurnosRouter.post('/send-album', async (req, res) => {
       image: it.base64 ? Buffer.from(it.base64, 'base64') : it.imageUrl,
       caption: it.caption,
     }))
-    const result = await sendAlbum(to, items, caption, companyId, userId)
+    const result = await sendAlbum(to, items, caption, companyId, userId, captionPosition === 'last' ? 'last' : 'first')
     res.json({ message: `Álbum enviado (${result.count} foto(s)).`, id: result.id, count: result.count })
   } catch (err) {
     res.status(502).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el álbum.' })

@@ -163,6 +163,7 @@ async function uSendAlbum(to: string, urls: string[], caption?: string, companyI
       to,
       images: urls.map((imageUrl) => ({ imageUrl })),
       caption,
+      captionPosition: 'last',
       companyId,
       userId,
     })
@@ -580,7 +581,9 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
       // Observaciones: junta los comentarios distintos de las fotos del producto.
       const obsList = [...new Set(sendable.map((p) => (p.comment ?? '').trim()).filter(Boolean))]
       const obs = obsList.length ? `\n📝 ${obsList.join(' · ')}` : ''
-      const caption = `📦 *${prod.productCode}*${desc}${obs}`
+      // Línea 1: código en negrita. Línea 2: descripción (con Cliente/Placa de la
+      // DATA). Línea 3 (si hay): observaciones.
+      const caption = `*${prod.productCode}*${desc}${obs}`
 
       const urls = sendable.map((p) => p.driveUrl as string)
       try {
@@ -660,7 +663,9 @@ whatsappWebRouter.post('/send-product', async (req, res) => {
     const desc = prod.labelData?.descripcion ? `\n${prod.labelData.descripcion}` : ''
     const obsList = [...new Set(sendable.map((p) => (p.comment ?? '').trim()).filter(Boolean))]
     const obs = obsList.length ? `\n📝 ${obsList.join(' · ')}` : ''
-    const caption = `📦 *${prod.productCode}*${desc}${obs}`
+    // Línea 1: código en negrita. Línea 2: descripción (con Cliente/Placa de la
+    // DATA). Línea 3 (si hay): observaciones.
+    const caption = `*${prod.productCode}*${desc}${obs}`
 
     // Un producto (registro + destino) se envía UNA sola vez por ventana corta.
     const { data: result, deduped } = await sendOnce(`prod|${trackingCode}|${to}|${productCode}`, async () => {

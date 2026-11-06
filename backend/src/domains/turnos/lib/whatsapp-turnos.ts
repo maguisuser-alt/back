@@ -147,19 +147,22 @@ export async function sendAlbum(
   caption?: string,
   companyId?: string,
   userId?: string,
+  /** Dónde va el caption global: en la primera foto (por defecto) o en la última. */
+  captionPosition: 'first' | 'last' = 'first',
 ): Promise<{ id: string | null; count: number }> {
   if (images.length === 0) return { id: null, count: 0 }
 
   let firstId: string | null = null
   let count = 0
+  const captionIdx = captionPosition === 'last' ? images.length - 1 : 0
 
   for (let i = 0; i < images.length; i++) {
     const it = images[i]
     const img = typeof it.image === 'string' ? { url: it.image } : it.image
 
-    // El caption global va en la primera imagen.
+    // El caption global va en la foto indicada por `captionPosition`.
     // Si la imagen individual tiene su propio caption, se usa ese (prioridad).
-    const finalCaption = it.caption ?? (i === 0 ? caption : undefined)
+    const finalCaption = it.caption ?? (i === captionIdx ? caption : undefined)
 
     const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
       image: img,

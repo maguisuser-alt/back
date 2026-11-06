@@ -236,14 +236,19 @@ export async function sendAlbum(
   //    visualmente por sí mismo cuando llegan seguidas.
   let firstId: string | null = null
   let count = 0
+  let captionSent = false
   for (let i = 0; i < buffers.length; i++) {
+    // El caption va en la ÚLTIMA imagen: WhatsApp agrupa en cuadrícula las
+    // imágenes seguidas sin texto y muestra el texto debajo del grupo, como un
+    // álbum. Con el texto en la primera, esa foto queda suelta.
+    const isLast = i === buffers.length - 1
     try {
       const res = await manager.sendContent<{ key: { id: string } }>(companyId, userId, to, {
         image: buffers[i],
-        // El caption va en la PRIMERA imagen enviada con éxito.
-        ...(count === 0 && caption ? { caption } : {}),
+        ...(isLast && caption ? { caption } : {}),
       })
       if (count === 0) firstId = res?.key?.id ?? null
+      if (isLast && caption) captionSent = true
       count++
     } catch (err) {
       console.error(`[whatsapp:trazabilidad] Fallo al enviar imagen ${i} del grupo:`, err)
@@ -258,6 +263,15 @@ export async function sendAlbum(
   // Si no se pudo enviar NINGUNA imagen (p. ej. conexión caída a mitad), es un
   // fallo real: no lo reportes como éxito con 0 fotos.
   if (count === 0) throw new Error('No se pudo enviar ninguna foto del grupo. Revisa la conexión de WhatsApp.')
+  // Si la última foto falló, el texto no salió: se manda como mensaje aparte
+  // para no perderlo.
+  if (caption && !captionSent) {
+    try {
+      await manager.sendContent(companyId, userId, to, { text: caption })
+    } catch (err) {
+      console.error('[whatsapp:trazabilidad] No se pudo enviar el texto del álbum:', err)
+    }
+  }
   return { id: firstId, count }
 }
 
