@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from 'express'
 import { verifyToken } from '../lib/auth.js'
-import { readDatabase } from '../lib/database.js'
+import { getCompaniesCollection, getUsersCollection } from '../lib/mongodb.js'
 import type { AuthUser, UserRole } from '../types.js'
 
 declare global {
@@ -37,11 +37,26 @@ export function requireAuth(request: Request, response: Response, next: NextFunc
   }
 }
 
+/** Caché corta del estado "activa" por empresa: evita una consulta a Mongo en cada request. */
+const ACTIVE_CACHE_TTL_MS = 20_000
+const activeCache = new Map<string, { activa: boolean; at: number }>()
+
+/** Devuelve false solo si la empresa existe y está marcada como inactiva. Falla abierto. */
+async function isCompanyActive(companyId: string): Promise<boolean> {
+  const hit = activeCache.get(companyId)
+  if (hit && Date.now() - hit.at < ACTIVE_CACHE_TTL_MS) return hit.activa
+  const company = (await (await getCompaniesCollection()).findOne(
+    { id: companyId } as any,
+    { projection: { _id: 0, activa: 1 } },
+  )) as { activa?: boolean } | null
+  const activa = company?.activa !== false
+  activeCache.set(companyId, { activa, at: Date.now() })
+  return activa
+}
+
 async function checkCompanyActive(request: Request, response: Response, next: NextFunction) {
   try {
-    const db = await readDatabase()
-    const company = db.companies.find((c) => c.id === request.authUser!.companyId)
-    if (company && company.activa === false) {
+    if (!(await isCompanyActive(request.authUser!.companyId))) {
       response.status(403).json({ message: 'Tu empresa está inactiva. Contacta al administrador del sistema.' })
       return
     }
@@ -62,9 +77,7 @@ export async function requireActiveCompany(request: Request, response: Response,
   }
 
   try {
-    const db = await readDatabase()
-    const company = db.companies.find((c) => c.id === request.authUser!.companyId)
-    if (company && company.activa === false) {
+    if (!(await isCompanyActive(request.authUser.companyId))) {
       response.status(403).json({ message: 'Tu empresa está inactiva. Contacta al administrador del sistema.' })
       return
     }
@@ -108,8 +121,10 @@ export function requireRole(roles: UserRole[]) {
     if (roles.includes('supervisor') && request.authUser.role === 'operativo') {
       try {
         if (request._resolvedSupervisor === undefined) {
-          const db = await readDatabase()
-          const user = db.users.find((u) => u.id === request.authUser!.userId)
+          const user = (await (await getUsersCollection()).findOne(
+            { id: request.authUser!.userId } as any,
+            { projection: { _id: 0, cargo: 1 } },
+          )) as { cargo?: string } | null
           request._resolvedSupervisor = Boolean(user?.cargo?.toLowerCase().includes('supervisor'))
         }
         if (request._resolvedSupervisor) {
