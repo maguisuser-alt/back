@@ -10,6 +10,8 @@ import {
 import { Router } from 'express'
 import { createFaceVerificationLog, readDatabase, readLocalUser, updateTurn, updateUser, updateUserLocal, uploadFacialPhoto } from '../lib/database.js'
 import { registerFace, verifyFace } from '../lib/face-recognition.js'
+import { zonedTimeToMs } from '../lib/geo.js'
+import { getCompaniesCollection, getLocationsCollection, getTurnsCollection } from '../lib/mongodb.js'
 import { requireAuth } from '../middleware/auth.js'
 import type {
   AttendanceAction,
@@ -637,8 +639,13 @@ attendanceRouter.post('/mark', async (request, response) => {
     return
   }
 
-  const db = await readDatabase()
-  const turn = findAssignedTurn(db.turns, companyId, user.id, String(turnId))
+  // Consulta puntual (turno + empresa) en lugar de cargar toda la base
+  const [turnsCol, companiesCol] = await Promise.all([getTurnsCollection(), getCompaniesCollection()])
+  const turn = (await turnsCol.findOne(
+    { id: String(turnId), companyId, assignedToUserId: user.id } as any,
+    { projection: { _id: 0 } },
+  )) as Turn | null
+  const tz = ((await companiesCol.findOne({ id: companyId } as any, { projection: { _id: 0, 'settings.timezone': 1 } })) as any)?.settings?.timezone || 'America/Bogota'
 
   if (!turn) {
     response.status(404).json({ message: 'El turno asignado no existe o no pertenece a tu usuario.' })
@@ -652,7 +659,7 @@ attendanceRouter.post('/mark', async (request, response) => {
 
   // ── ENTRADA: solo permite 30 min antes de la hora de inicio ──
   if (parsedAction === 'entrada') {
-    const turnStartMs = new Date(`${turn.fecha}T${turn.hora}:00-05:00`).getTime()
+    const turnStartMs = zonedTimeToMs(turn.fecha, turn.hora, tz)
     const windowOpenMs = turnStartMs - 30 * 60 * 1000 // 30 min antes
     const now = Date.now()
     if (now < windowOpenMs) {
@@ -672,9 +679,10 @@ attendanceRouter.post('/mark', async (request, response) => {
   let locationCheck: ReturnType<typeof buildLocationCheck> = null
 
   if (parsedLatitude !== null && parsedLongitude !== null && turn.locationId) {
-    const location = db.locations.find(
-      (item) => item.id === turn.locationId && item.companyId === companyId,
-    )
+    const location = (await (await getLocationsCollection()).findOne(
+      { id: turn.locationId, companyId } as any,
+      { projection: { _id: 0 } },
+    )) as Location | null
     if (location) {
       locationCheck = buildLocationCheck(location, parsedLatitude, parsedLongitude)
     }
@@ -740,7 +748,7 @@ attendanceRouter.post('/mark', async (request, response) => {
   // ENTRADA: se registra con la hora de inicio del turno (en zona horaria Colombia UTC-5)
   // SALIDA: se registra con la hora real del momento
   const markedAt = parsedAction === 'entrada'
-    ? new Date(`${turn.fecha}T${turn.hora}:00-05:00`).toISOString()
+    ? new Date(zonedTimeToMs(turn.fecha, turn.hora, tz)).toISOString()
     : new Date().toISOString()
 
   const attendanceRecord: AttendanceRecord = {

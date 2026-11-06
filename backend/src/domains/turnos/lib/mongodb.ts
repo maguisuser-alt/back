@@ -62,6 +62,26 @@ export const getHorasTurnoCollection = () => col<HorasTurnoRecord>('horasTurno')
 export const getFacturasCollection = () => col<Factura>('facturas')
 export const getGroupsCollection = () => col<OperationGroup>('groups')
 
+/**
+ * Crea (idempotente) los índices que aceleran las consultas más frecuentes.
+ * Son pocos y livianos para no pasar el límite de 512 MB de Atlas M0.
+ */
+export async function ensureTurnosIndexes(): Promise<void> {
+  const [turns, horas, users, invitations] = await Promise.all([
+    getTurnsCollection(), getHorasTurnoCollection(), getUsersCollection(), getUserInvitationsCollection(),
+  ])
+  await Promise.all([
+    turns.createIndex({ companyId: 1, fecha: 1, estado: 1 }),
+    turns.createIndex({ assignedToUserId: 1, fecha: 1 }),
+    turns.createIndex({ estado: 1, fecha: 1 }),
+    horas.createIndex({ companyId: 1, fecha: 1 }),
+    horas.createIndex({ turnId: 1 }),
+    horas.createIndex({ userId: 1, fecha: 1 }),
+    users.createIndex({ companyId: 1 }),
+    invitations.createIndex({ status: 1, expiresAt: 1 }),
+  ])
+}
+
 // ── Colecciones de academia (históricamente servidas por back-turnos) ──
 export const getSubjectsCollection = () => col<Subject>('subjects')
 export const getAcademicCoursesCollection = () => col<AcademicCourse>('academicCourses')

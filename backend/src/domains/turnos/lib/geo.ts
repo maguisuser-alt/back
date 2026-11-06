@@ -12,6 +12,49 @@ export function todayInTimezone(timezone = 'America/Bogota'): string {
   }
 }
 
+/** Desfase (ms) de la zona horaria respecto a UTC en el instante dado. */
+function tzOffsetMs(timezone: string, at: Date): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone, hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(at)
+    const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0)
+    const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'))
+    return asUtc - Math.floor(at.getTime() / 1000) * 1000
+  } catch {
+    return -5 * 3_600_000 // fallback America/Bogota
+  }
+}
+
+/** Milisegundos UTC de una fecha (YYYY-MM-DD) y hora (HH:mm) locales en la zona dada. */
+export function zonedTimeToMs(fecha: string, hora: string, timezone = 'America/Bogota'): number {
+  const [y, mo, d] = fecha.split('-').map(Number)
+  const [h, mi] = hora.split(':').map(Number)
+  const guess = Date.UTC(y, (mo ?? 1) - 1, d, h, mi ?? 0)
+  const first = guess - tzOffsetMs(timezone, new Date(guess))
+  // Segunda pasada por si el desfase cambia entre ambos instantes (DST)
+  return guess - tzOffsetMs(timezone, new Date(first))
+}
+
+/** Hora local (0-23.99) en la zona dada para un instante. */
+export function localHourOf(ms: number, timezone = 'America/Bogota'): number {
+  const local = new Date(ms + tzOffsetMs(timezone, new Date(ms)))
+  return local.getUTCHours() + local.getUTCMinutes() / 60
+}
+
+/** Horas trabajadas dentro de la franja nocturna [startHour, endHour) (cruza medianoche). */
+export function nightHoursBetween(startMs: number, endMs: number, timezone: string, nightStart = 19, nightEnd = 6): number {
+  if (!(endMs > startMs)) return 0
+  let minutes = 0
+  for (let t = startMs; t < endMs; t += 60_000) {
+    const h = localHourOf(t, timezone)
+    if (h >= nightStart || h < nightEnd) minutes++
+  }
+  return Math.round((minutes / 60) * 100) / 100
+}
+
 function degreesToRadians(value: number): number {
   return (value * Math.PI) / 180
 }

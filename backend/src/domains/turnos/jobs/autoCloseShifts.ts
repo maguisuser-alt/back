@@ -1,30 +1,43 @@
 /**
  * Job automático que se ejecuta periódicamente para:
- * 1. Auto-cerrar turnos sin salida marcada (30 min después de horaFin)
- * 2. Auto-rechazar turnos no confirmados antes de su deadline
+ * 1. Auto-cerrar turnos sin salida marcada (gracia configurable tras horaFin)
+ * 2. Auto-finalizar clases académicas vencidas
  * 3. Eliminar invitaciones expiradas (más de 1 hora)
+ *
+ * Usa consultas filtradas (no carga toda la base) para ahorrar RAM en el plan gratis.
  */
-import { readDatabase, registerHorasTurno, updateClassSession, updateTurn, upsertStudentAttendance } from '../lib/database.js'
-import { getUserInvitationsCollection } from '../lib/mongodb.js'
-import type { AttendanceRecord, Turn } from '../types.js'
+import { registerHorasTurno, updateClassSession, updateTurn, upsertStudentAttendance } from '../lib/database.js'
+import { zonedTimeToMs } from '../lib/geo.js'
+import {
+  getAcademicGroupsCollection,
+  getClassSessionsCollection,
+  getCompaniesCollection,
+  getStudentAttendancesCollection,
+  getTurnsCollection,
+  getUserInvitationsCollection,
+  getUsersCollection,
+} from '../lib/mongodb.js'
+import type { AttendanceRecord, ClassSession, Company, Turn, User } from '../types.js'
 
-const AUTO_CLOSE_GRACE_MINUTES = 120  // 2 horas después de horaFin
+const DEFAULT_GRACE_MINUTES = 120  // 2 horas después de horaFin
+const DEFAULT_TIMEZONE = 'America/Bogota'
 
-function buildAutoCheckOut(turn: Turn): AttendanceRecord | null {
-  if (!turn.horaFin || !turn.fecha) return null
-
-  // Calcula la hora de fin (soporta turnos nocturnos)
-  const [sh, sm] = turn.hora.split(':').map(Number)
+/** Inicio y fin (ms UTC) de un turno en la zona horaria dada; soporta turnos nocturnos. */
+function turnRangeMs(turn: Turn, timezone: string): { startMs: number; endMs: number } | null {
+  if (!turn.horaFin || !turn.fecha || !turn.hora) return null
   const [eh, em] = turn.horaFin.split(':').map(Number)
   if (Number.isNaN(eh) || Number.isNaN(em)) return null
-
-  let endMs = new Date(`${turn.fecha}T${String(eh).padStart(2, '0')}:${String(em).padStart(2, '0')}:00-05:00`).getTime()
-  const startMs = new Date(`${turn.fecha}T${String(sh).padStart(2, '0')}:${String(sm).padStart(2, '0')}:00-05:00`).getTime()
+  const startMs = zonedTimeToMs(turn.fecha, turn.hora, timezone)
+  let endMs = zonedTimeToMs(turn.fecha, turn.horaFin, timezone)
   if (endMs <= startMs) endMs += 24 * 3_600_000 // nocturno
+  return { startMs, endMs }
+}
 
+function buildAutoCheckOut(turn: Turn, endMs: number): AttendanceRecord {
+  const iso = new Date(endMs).toISOString()
   return {
     action: 'salida',
-    markedAt: new Date(endMs).toISOString(),
+    markedAt: iso,
     method: 'auto',
     credentialId: 'system',
     locationCheck: {
@@ -35,109 +48,144 @@ function buildAutoCheckOut(turn: Turn): AttendanceRecord | null {
       withinRange: true,
       locationId: turn.locationId ?? '',
       locationNombre: turn.locationNombre,
-      verifiedAt: new Date(endMs).toISOString(),
+      verifiedAt: iso,
     },
   }
 }
 
 export async function runAutoCloseShifts() {
   const now = Date.now()
-  const db = await readDatabase()
   let closedCount = 0
-  let rejectedCount = 0
 
-  for (const turn of db.turns) {
-    // ── Auto-cierre: turnos en_proceso/confirmado con checkIn pero sin checkOut, 2h después de horaFin
-    // Cierra con la hora de salida programada del turno (horaFin)
-    if (
-      (turn.estado === 'en_proceso' || turn.estado === 'confirmado') &&
-      turn.attendance?.checkIn &&
-      !turn.attendance?.checkOut &&
-      turn.horaFin &&
-      turn.fecha
-    ) {
-      const [eh, em] = turn.horaFin.split(':').map(Number)
-      const [sh, sm] = turn.hora.split(':').map(Number)
-      if (!Number.isNaN(eh) && !Number.isNaN(em)) {
-        let endMs = new Date(`${turn.fecha}T${String(eh).padStart(2, '0')}:${String(em).padStart(2, '0')}:00-05:00`).getTime()
-        const startMs = new Date(`${turn.fecha}T${String(sh).padStart(2, '0')}:${String(sm).padStart(2, '0')}:00-05:00`).getTime()
-        if (endMs <= startMs) endMs += 24 * 3_600_000
+  const [turnsCol, usersCol, companiesCol] = await Promise.all([
+    getTurnsCollection(), getUsersCollection(), getCompaniesCollection(),
+  ])
 
-        const graceEnd = endMs + AUTO_CLOSE_GRACE_MINUTES * 60_000
+  // ── Auto-cierre: solo turnos abiertos (con checkIn y sin checkOut) ──
+  const openTurns = (await turnsCol
+    .find({
+      estado: { $in: ['en_proceso', 'confirmado'] },
+      'attendance.checkIn': { $exists: true, $ne: null },
+      'attendance.checkOut': null, // null también coincide con campo ausente
+      horaFin: { $exists: true, $ne: '' },
+    } as any)
+    .project({ _id: 0 })
+    .toArray()) as unknown as Turn[]
 
-        if (now >= graceEnd) {
-          const autoCheckOut = buildAutoCheckOut(turn)
-          if (autoCheckOut) {
-            turn.attendance = { ...turn.attendance, checkOut: autoCheckOut }
-            // Supervisores no necesitan aprobación
-            const assignedUser = db.users.find((u) => u.id === turn.assignedToUserId)
-            const isAssignedSupervisor = assignedUser?.role === 'supervisor'
-              || (assignedUser?.role !== 'admin' && Boolean(assignedUser?.cargo?.toLowerCase().includes('supervisor')))
-            turn.estado = (turn.confirmedAt || isAssignedSupervisor) ? 'finalizado' : 'no_aprobado'
-            turn.updatedAt = new Date().toISOString()
-            await updateTurn(turn)
-            // Registra las horas trabajadas
-            await registerHorasTurno({
-              turn,
-              userName: assignedUser?.nombreCompleto ?? turn.assignedToUserName ?? '',
-              cargo: assignedUser?.cargo ?? '',
-              locationNombre: turn.locationNombre,
-            })
-            closedCount++
-          }
-        }
-      }
+  if (openTurns.length > 0) {
+    const companyIds = [...new Set(openTurns.map((t) => t.companyId))]
+    const userIds = [...new Set(openTurns.map((t) => t.assignedToUserId).filter(Boolean) as string[])]
+    const [companies, users] = await Promise.all([
+      companiesCol.find({ id: { $in: companyIds } } as any).project({ _id: 0 }).toArray() as unknown as Promise<Company[]>,
+      usersCol.find({ id: { $in: userIds } } as any).project({ _id: 0 }).toArray() as unknown as Promise<User[]>,
+    ])
+    const companyById = new Map(companies.map((c) => [c.id, c]))
+    const userById = new Map(users.map((u) => [u.id, u]))
+
+    for (const turn of openTurns) {
+      const settings = companyById.get(turn.companyId)?.settings
+      const timezone = settings?.timezone || DEFAULT_TIMEZONE
+      const graceMinutes = settings?.autoCloseGraceMinutes ?? DEFAULT_GRACE_MINUTES
+
+      const range = turnRangeMs(turn, timezone)
+      if (!range) continue
+      if (now < range.endMs + graceMinutes * 60_000) continue
+
+      turn.attendance = { ...turn.attendance, checkOut: buildAutoCheckOut(turn, range.endMs) }
+
+      // Supervisores no necesitan aprobación
+      const assignedUser = userById.get(turn.assignedToUserId ?? '')
+      const isAssignedSupervisor = assignedUser?.role === 'supervisor'
+        || (assignedUser?.role !== 'admin' && Boolean(assignedUser?.cargo?.toLowerCase().includes('supervisor')))
+      turn.estado = (turn.confirmedAt || isAssignedSupervisor) ? 'finalizado' : 'no_aprobado'
+      turn.updatedAt = new Date().toISOString()
+      await updateTurn(turn)
+
+      // Registra las horas trabajadas con la configuración de la empresa
+      await registerHorasTurno({
+        turn,
+        userName: assignedUser?.nombreCompleto ?? turn.assignedToUserName ?? '',
+        cargo: assignedUser?.cargo ?? '',
+        locationNombre: turn.locationNombre,
+        valorHora: settings?.billingRateDefault,
+        recargoDominical: settings?.recargoDominical,
+        recargoFestivo: settings?.recargoFestivo,
+        recargoNocturno: settings?.recargoNocturno,
+        jornadaOrdinaria: settings?.jornadaOrdinaria,
+        nocturnoInicioHora: settings?.nocturnoInicioHora,
+        nocturnoFinHora: settings?.nocturnoFinHora,
+        timezone,
+      })
+      closedCount++
     }
-
-    // ── Auto-rechazo: turnos asignados cuyo deadline ya pasó sin confirmación
-    // NOTA: Deshabilitado — el empleado puede marcar entrada sin importar el deadline.
-    // El deadline es solo informativo. El auto-close por horaFin sigue activo.
   }
 
-  if (closedCount > 0 || rejectedCount > 0) {
-    console.log(`[auto-close] ${closedCount} turno(s) cerrado(s) automáticamente, ${rejectedCount} rechazado(s) por vencimiento.`)
+  if (closedCount > 0) {
+    console.log(`[auto-close] ${closedCount} turno(s) cerrado(s) automáticamente.`)
   }
+  // NOTA: el auto-rechazo por deadline sigue deshabilitado (el deadline es solo informativo).
 
   // ── Auto-finalizar clases académicas cuya hora de fin ya pasó ──
-  // Las clases en estado programada/en_curso se marcan "finalizada" automáticamente
-  // una vez pasada su horaFin (zona America/Bogota, UTC-5). Los alumnos del grupo
-  // que no registraron ingreso quedan "ausente".
   let clasesFinalizadas = 0
-  for (const session of db.classSessions) {
-    if (session.estado !== 'programada' && session.estado !== 'en_curso') continue
-    if (!session.fecha || !session.horaFin) continue
-    const [eh, em] = session.horaFin.split(':').map(Number)
-    if (Number.isNaN(eh) || Number.isNaN(em)) continue
-    const endMs = new Date(`${session.fecha}T${String(eh).padStart(2, '0')}:${String(em).padStart(2, '0')}:00-05:00`).getTime()
-    if (Number.isNaN(endMs) || now < endMs) continue
+  const [sessionsCol, groupsCol, attendancesCol] = await Promise.all([
+    getClassSessionsCollection(), getAcademicGroupsCollection(), getStudentAttendancesCollection(),
+  ])
+  const pendingSessions = (await sessionsCol
+    .find({ estado: { $in: ['programada', 'en_curso'] } } as any)
+    .project({ _id: 0 })
+    .toArray()) as unknown as ClassSession[]
 
-    session.estado = 'finalizada'
-    session.updatedAt = new Date().toISOString()
-    await updateClassSession(session)
-    clasesFinalizadas++
+  if (pendingSessions.length > 0) {
+    const sessionCompanyIds = [...new Set(pendingSessions.map((s) => s.companyId))]
+    const sessionCompanies = (await companiesCol
+      .find({ id: { $in: sessionCompanyIds } } as any)
+      .project({ _id: 0, id: 1, 'settings.timezone': 1 })
+      .toArray()) as unknown as Company[]
+    const tzByCompany = new Map(sessionCompanies.map((c) => [c.id, c.settings?.timezone || DEFAULT_TIMEZONE]))
 
-    // Marcar ausentes a los alumnos del grupo sin asistencia registrada.
-    const grupo = db.academicGroups.find((g) => g.id === session.academicGroupId && g.companyId === session.companyId)
-    for (const uid of grupo?.estudianteUserIds ?? []) {
-      const yaTiene = db.studentAttendances.some((a) => a.sessionId === session.id && a.estudianteUserId === uid)
-      if (yaTiene) continue
-      const alumno = db.users.find((u) => u.id === uid)
-      if (!alumno) continue
-      await upsertStudentAttendance(
-        { sessionId: session.id, estudianteUserId: uid },
-        {
-          companyId: session.companyId,
-          sessionId: session.id,
-          academicGroupId: session.academicGroupId,
-          subjectId: session.subjectId,
-          fecha: session.fecha,
-          estudianteUserId: uid,
-          estudianteNombre: alumno.nombreCompleto,
-          estado: 'ausente',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        },
-      )
+    for (const session of pendingSessions) {
+      if (!session.fecha || !session.horaFin) continue
+      const tz = tzByCompany.get(session.companyId) ?? DEFAULT_TIMEZONE
+      const endMs = zonedTimeToMs(session.fecha, session.horaFin, tz)
+      if (Number.isNaN(endMs) || now < endMs) continue
+
+      session.estado = 'finalizada'
+      session.updatedAt = new Date().toISOString()
+      await updateClassSession(session)
+      clasesFinalizadas++
+
+      // Marcar ausentes a los alumnos del grupo sin asistencia registrada.
+      const grupo = (await groupsCol.findOne({ id: session.academicGroupId, companyId: session.companyId } as any)) as any
+      const studentIds: string[] = grupo?.estudianteUserIds ?? []
+      if (studentIds.length === 0) continue
+
+      const [existing, alumnos] = await Promise.all([
+        attendancesCol.find({ sessionId: session.id } as any).project({ estudianteUserId: 1 }).toArray(),
+        usersCol.find({ id: { $in: studentIds } } as any).project({ _id: 0, id: 1, nombreCompleto: 1 }).toArray() as unknown as Promise<User[]>,
+      ])
+      const yaTienen = new Set(existing.map((a: any) => a.estudianteUserId))
+      const nombreById = new Map(alumnos.map((u) => [u.id, u.nombreCompleto]))
+
+      for (const uid of studentIds) {
+        if (yaTienen.has(uid)) continue
+        const nombre = nombreById.get(uid)
+        if (!nombre) continue
+        await upsertStudentAttendance(
+          { sessionId: session.id, estudianteUserId: uid },
+          {
+            companyId: session.companyId,
+            sessionId: session.id,
+            academicGroupId: session.academicGroupId,
+            subjectId: session.subjectId,
+            fecha: session.fecha,
+            estudianteUserId: uid,
+            estudianteNombre: nombre,
+            estado: 'ausente',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        )
+      }
     }
   }
   if (clasesFinalizadas > 0) {
@@ -147,10 +195,9 @@ export async function runAutoCloseShifts() {
   // ── Eliminar invitaciones expiradas (pendientes que ya pasaron de 1 hora)
   try {
     const invCol = await getUserInvitationsCollection()
-    const nowISO = new Date().toISOString()
     const deleteResult = await invCol.deleteMany({
       status: 'pendiente',
-      expiresAt: { $lt: nowISO },
+      expiresAt: { $lt: new Date().toISOString() },
     })
     if (deleteResult.deletedCount > 0) {
       console.log(`[auto-close] ${deleteResult.deletedCount} invitación(es) expirada(s) eliminada(s).`)

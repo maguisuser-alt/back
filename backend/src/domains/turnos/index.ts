@@ -24,7 +24,7 @@ import { turnsRouter } from './routes/turns.js'
 import { whatsappTurnosRouter } from './routes/whatsapp-turnos.js'
 import { whatsappConfigRouter } from './routes/whatsapp-config.js'
 import { isWhatsAppTurnosEnabled, resumeSavedSessions, reconnectDroppedSessions } from './lib/whatsapp-turnos.js'
-import { connectMongo } from './lib/mongodb.js'
+import { connectMongo, ensureTurnosIndexes } from './lib/mongodb.js'
 import { runAutoCloseShifts } from './jobs/autoCloseShifts.js'
 
 export const turnosRouter = Router()
@@ -95,6 +95,7 @@ export async function initTurnos(): Promise<void> {
   try {
     await connectMongo()
     console.log('[turnos] MongoDB conectado.')
+    void ensureTurnosIndexes().catch((e) => console.warn('[turnos] No se pudieron crear índices:', e instanceof Error ? e.message : e))
   } catch (err) {
     console.warn('[turnos] MongoDB no disponible al iniciar; se reintentará por request.', err instanceof Error ? err.message : err)
   }

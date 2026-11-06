@@ -506,6 +506,9 @@ export type CompanySettings = {
   jornadaOrdinaria?: number            // Horas jornada ordinaria (default 8)
   permitirTeletrabajo?: boolean        // Habilita fichaje remoto
   permitirPermutaTurnos?: boolean      // Permite cambio de turnos entre empleados
+  autoCloseGraceMinutes?: number       // Minutos tras horaFin para autocerrar un turno sin salida (default 120)
+  nocturnoInicioHora?: number          // Hora local en que inicia el horario nocturno (default 19)
+  nocturnoFinHora?: number             // Hora local en que termina el horario nocturno (default 6)
 
   // ── Academia ─────────────────────────────────────────────
   maxInasistenciaPorcentaje?: number   // % máximo de faltas antes de perder materia (default 20)
@@ -725,6 +728,10 @@ export type HorasTurnoRecord = {
   horasOrdinarias: number              // Horas en día laboral normal
   horasDominicales: number             // Horas en domingo
   horasFestivas: number                // Horas en festivo
+  horasNocturnas?: number              // Horas dentro del horario nocturno (informativo + recargo)
+  horasExtra?: number                  // Horas por encima de la jornada ordinaria
+  recargoNocturno?: number             // % recargo nocturno aplicado
+  subtotalNocturno?: number            // Recargo nocturno: horasNocturnas × valorHora × recargoNocturno/100
   metodoSalida?: 'webauthn' | 'pin' | 'auto'
   valorHora?: number                   // Tarifa hora ordinaria
   recargoDominical?: number            // % recargo dominical (default 75%)

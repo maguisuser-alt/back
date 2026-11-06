@@ -3,6 +3,7 @@
  * Apps Script se usa SOLO para subir fotos faciales a Google Drive.
  */
 import { nanoid } from 'nanoid'
+import { nightHoursBetween } from './geo.js'
 import {
   getAcademicCoursesCollection,
   getAcademicEventsCollection,
@@ -350,10 +351,18 @@ export async function registerHorasTurno(params: {
   confirmadoPor?: string
   recargoDominical?: number
   recargoFestivo?: number
+  recargoNocturno?: number
+  jornadaOrdinaria?: number
+  timezone?: string
+  nocturnoInicioHora?: number
+  nocturnoFinHora?: number
 }) {
   const { turn, userName, cargo, locationNombre, valorHora, confirmadoPor } = params
   const recargoDominical = params.recargoDominical ?? 75
   const recargoFestivo = params.recargoFestivo ?? 100
+  const recargoNocturno = params.recargoNocturno ?? 35
+  const jornadaOrdinaria = params.jornadaOrdinaria ?? 8
+  const timezone = params.timezone ?? 'America/Bogota'
   const checkIn = turn.attendance?.checkIn?.markedAt
   const checkOut = turn.attendance?.checkOut?.markedAt
   if (!checkIn) return null
@@ -373,10 +382,17 @@ export async function registerHorasTurno(params: {
   else if (esDominical) horasDominicales = horasTrabajadas
   else horasOrdinarias = horasTrabajadas
 
+  // Horas nocturnas (informativas + recargo) y extras sobre la jornada ordinaria
+  const horasNocturnas = checkIn && checkOut
+    ? nightHoursBetween(new Date(checkIn).getTime(), new Date(checkOut).getTime(), timezone, params.nocturnoInicioHora ?? 19, params.nocturnoFinHora ?? 6)
+    : 0
+  const horasExtra = Math.max(0, Math.round((horasTrabajadas - jornadaOrdinaria) * 100) / 100)
+  const subtotalNocturno = valorHora ? Math.round(horasNocturnas * valorHora * (recargoNocturno / 100) * 100) / 100 : undefined
+
   const subtotalOrdinario = valorHora ? Math.round(horasOrdinarias * valorHora * 100) / 100 : undefined
   const subtotalDominical = valorHora ? Math.round(horasDominicales * valorHora * (1 + recargoDominical / 100) * 100) / 100 : undefined
   const subtotalFestivo = valorHora ? Math.round(horasFestivas * valorHora * (1 + recargoFestivo / 100) * 100) / 100 : undefined
-  const subtotal = valorHora ? (subtotalOrdinario ?? 0) + (subtotalDominical ?? 0) + (subtotalFestivo ?? 0) : undefined
+  const subtotal = valorHora ? (subtotalOrdinario ?? 0) + (subtotalDominical ?? 0) + (subtotalFestivo ?? 0) + (subtotalNocturno ?? 0) : undefined
 
   const fmtTime = (iso: string | undefined) => {
     if (!iso) return undefined
@@ -399,6 +415,7 @@ export async function registerHorasTurno(params: {
     horaEntradaReal: fmtTime(checkIn),
     horaSalidaReal: fmtTime(checkOut),
     horasTrabajadas, horasOrdinarias, horasDominicales, horasFestivas,
+    horasNocturnas, horasExtra, recargoNocturno, subtotalNocturno,
     metodoSalida: turn.attendance?.checkOut?.method,
     valorHora, recargoDominical, recargoFestivo,
     subtotalOrdinario, subtotalDominical, subtotalFestivo, subtotal,
