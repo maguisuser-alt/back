@@ -13,7 +13,7 @@
 import { Router } from 'express'
 import { nanoid } from 'nanoid'
 import { requireAuth, requireRole } from '../middleware/auth.js'
-import { zonedTimeToMs } from '../lib/geo.js'
+import { todayInTimezone, zonedTimeToMs } from '../lib/geo.js'
 import { getCompaniesCollection, getDb, getTurnsCollection, getUsersCollection } from '../lib/mongodb.js'
 import type { Company, Turn, TurnSwap, User } from '../types.js'
 
@@ -49,6 +49,34 @@ async function hasConflict(userId: string, fecha: string, excludeIds: string[]):
   } as any)
   return Boolean(found)
 }
+
+/** GET /swaps/config — indica si la empresa tiene activada la permuta (lo puede leer cualquier rol). */
+swapsRouter.get('/config', async (request, response) => {
+  const company = await loadCompany(request.authUser!.companyId)
+  response.json({ enabled: Boolean(company?.settings?.permitirPermutaTurnos) })
+})
+
+/** GET /swaps/candidates — turnos futuros de compañeros con los que se puede permutar. */
+swapsRouter.get('/candidates', async (request, response) => {
+  const { companyId, userId } = request.authUser!
+  const company = await loadCompany(companyId)
+  if (!company?.settings?.permitirPermutaTurnos) { response.json([]); return }
+  const timezone = company.settings.timezone || 'America/Bogota'
+  const turns = await getTurnsCollection()
+  const rows = (await turns
+    .find({
+      companyId,
+      estado: { $in: ACTIVE_TURN_STATES },
+      assignedToUserId: { $exists: true, $nin: ['', userId] },
+      'attendance.checkIn': null,
+      fecha: { $gte: todayInTimezone(timezone) },
+    } as any)
+    .project({ _id: 0, id: 1, fecha: 1, hora: 1, horaFin: 1, locationNombre: 1, assignedToUserId: 1, assignedToUserName: 1, estado: 1 })
+    .sort({ fecha: 1, hora: 1 })
+    .limit(100)
+    .toArray()) as unknown as Turn[]
+  response.json(rows.filter((t) => !isSwappable(t, timezone)))
+})
 
 /** GET /swaps — supervisores/admin ven todas; el resto, solo las suyas. */
 swapsRouter.get('/', async (request, response) => {
