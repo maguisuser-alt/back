@@ -9,6 +9,7 @@
  */
 import { getOperationsCollection, getDb } from '../lib/mongodb.js'
 import { deletePhotoStorage } from '../lib/drive-upload.js'
+import { referencedPhotoIdsExcept, isPhotoShared, isPrefixReferenced } from '../lib/photo-refs.js'
 
 const DEFAULT_MAX_AGE_DAYS = 20
 
@@ -56,13 +57,28 @@ export async function runCleanupOldOperations(): Promise<{ deleted: number; skip
       const oldOps = await col.find({ companyId, createdAt: { $lt: cutoffISO } }).toArray()
       if (oldOps.length === 0) continue
 
+      // Archivos que siguen usando los registros que NO se borran (productos
+      // vinculados comparten los archivos del registro original). Si no se
+      // puede calcular, NO se borra nada de esta empresa: borrar a ciegas
+      // dejaba sin fotos a registros recientes.
+      const deleteSet = oldOps.map((o) => o.trackingCode as string)
+      let stillUsed: Set<string>
+      try {
+        stillUsed = await referencedPhotoIdsExcept({ companyId, excludeOps: deleteSet })
+      } catch (refErr) {
+        console.warn(`[cleanup] Empresa ${companyId}: no se pudo verificar fotos compartidas, se omite este barrido:`, refErr instanceof Error ? refErr.message : refErr)
+        continue
+      }
+
+      let keptShared = 0
       for (const op of oldOps) {
         const trackingCode = op.trackingCode as string
 
-        // 1) Borrar cada foto de su almacenamiento (R2 y/o GitHub).
-        //    deletePhotoStorage detecta por fileId/driveUrl de dónde viene.
+        // 1) Borrar cada foto de su almacenamiento (R2 y/o GitHub), salvo las
+        //    que otro registro sigue usando.
         const photos = collectPhotos(op as Record<string, unknown>)
         for (const ph of photos) {
+          if (isPhotoShared(ph, stillUsed)) { keptShared++; continue }
           try {
             await deletePhotoStorage(ph)
           } catch (storageErr) {
@@ -70,18 +86,22 @@ export async function runCleanupOldOperations(): Promise<{ deleted: number; skip
           }
         }
 
-        // 2) Best-effort: borrar por prefijo en R2 por si quedaran huérfanos.
-        try {
-          const { deleteByPrefix } = await import('../lib/storage.js')
-          await deleteByPrefix(`operations/${trackingCode}/`)
-        } catch { /* R2 puede no estar configurado */ }
+        // 2) Borrar por prefijo en R2 (huérfanos) SOLO si ningún registro vivo
+        //    usa archivos de esa carpeta.
+        const prefix = `operations/${trackingCode}/`
+        if (!isPrefixReferenced(prefix, stillUsed)) {
+          try {
+            const { deleteByPrefix } = await import('../lib/storage.js')
+            await deleteByPrefix(prefix)
+          } catch { /* R2 puede no estar configurado */ }
+        }
 
         // 3) Eliminar de MongoDB
         await col.deleteOne({ trackingCode })
         totalDeleted++
       }
 
-      console.log(`[cleanup] Empresa ${companyId}: ${oldOps.length} operación(es) con más de ${days} días eliminadas (R2 + GitHub).`)
+      console.log(`[cleanup] Empresa ${companyId}: ${oldOps.length} operación(es) con más de ${days} días eliminadas (R2 + GitHub)${keptShared ? `; ${keptShared} foto(s) conservada(s) por estar vinculadas a registros vigentes` : ''}.`)
     }
 
     return { deleted: totalDeleted, skipped: '' }

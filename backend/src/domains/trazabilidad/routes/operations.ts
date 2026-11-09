@@ -6,6 +6,7 @@ import { refreshPhotoUrls } from '../lib/storage.js'
 import { sendOperationEmail } from '../lib/email.js'
 import { getStepsForType, LINEA_BLANCA_STEPS, OPTIONAL_STEPS, normalizeClientTimestamp, type CompanyLocation, type LineaBlancaProduct, type LocationRef, type OperationType, type PhotoRecord } from '../types.js'
 import { existingClientKeys, isDuplicateKey } from '../lib/photo-dedupe.js'
+import { referencedPhotoIdsExcept, isPhotoShared, isPrefixReferenced } from '../lib/photo-refs.js'
 import { readAllowed } from '../lib/features.js'
 import { toLocationRef, recordMovement } from '../lib/locations.js'
 
@@ -1526,21 +1527,36 @@ operationsRouter.delete('/:trackingCode', async (req, res) => {
       return
     }
 
-    // Eliminar todos los objetos de la operación en R2 (prefijo operations/<trackingCode>/)
-    let storageDeleted = 0
-    try {
-      const { deleteByPrefix } = await import('../lib/storage.js')
-      storageDeleted = await deleteByPrefix(`operations/${trackingCode}/`)
-    } catch (storageErr) {
-      console.warn('[delete] Error al eliminar objetos de R2:', storageErr instanceof Error ? storageErr.message : storageErr)
-    }
-
-    // Eliminar también de GitHub (R2 por prefijo no cubre GitHub).
+    // Archivos que otros registros siguen usando (productos vinculados comparten
+    // archivos): se conservan. Si no se puede verificar, no se borra ningún
+    // archivo (solo el registro), para no dejar sin fotos a otros registros.
     const allPhotos = [
       ...((operation.photos as PhotoRecord[]) ?? []),
       ...(((operation.lineaBlanca as LineaBlancaProduct[]) ?? []).flatMap((p) => p.photos ?? [])),
     ]
-    await deleteAllPhotosStorage(allPhotos)
+    let stillUsed: Set<string> | null = null
+    try {
+      stillUsed = await referencedPhotoIdsExcept({ companyId: operation.companyId as string | undefined, excludeOps: [trackingCode] })
+    } catch (refErr) {
+      console.warn('[delete] No se pudo verificar fotos compartidas; se conservan los archivos:', refErr instanceof Error ? refErr.message : refErr)
+    }
+
+    let storageDeleted = 0
+    if (stillUsed) {
+      const prefix = `operations/${trackingCode}/`
+      // Por prefijo solo si ningún registro vivo usa archivos de esa carpeta.
+      if (!isPrefixReferenced(prefix, stillUsed)) {
+        try {
+          const { deleteByPrefix } = await import('../lib/storage.js')
+          storageDeleted = await deleteByPrefix(prefix)
+        } catch (storageErr) {
+          console.warn('[delete] Error al eliminar objetos de R2:', storageErr instanceof Error ? storageErr.message : storageErr)
+        }
+      }
+      // GitHub y archivos sueltos, saltando los compartidos.
+      const used = stillUsed
+      await deleteAllPhotosStorage(allPhotos.filter((ph) => !isPhotoShared(ph, used)))
+    }
 
     // Siempre eliminar de MongoDB, independiente del resultado del storage
     await col.deleteOne({ trackingCode })
@@ -1575,13 +1591,29 @@ operationsRouter.delete('/:trackingCode/linea-blanca/:productCode', async (req, 
       return
     }
 
-    // Eliminar las imágenes del producto en R2 (prefijo) y en GitHub (por foto).
+    // Eliminar las imágenes del producto en R2 (prefijo) y en GitHub (por foto),
+    // conservando las que otro registro (o el mismo, en otro producto) sigue usando.
     if (productToDelete) {
+      let stillUsed: Set<string> | null = null
       try {
-        const { deleteByPrefix } = await import('../lib/storage.js')
-        await deleteByPrefix(`operations/${trackingCode}/${productCode.replace(/[^a-zA-Z0-9._-]/g, '_')}/`)
-      } catch (e) { console.warn('[operations] Error al eliminar imágenes del producto en R2:', e instanceof Error ? e.message : e) }
-      await deleteAllPhotosStorage(productToDelete.photos ?? [])
+        stillUsed = await referencedPhotoIdsExcept({
+          companyId: operation.companyId as string | undefined,
+          excludeProduct: { trackingCode, productCode },
+        })
+      } catch (refErr) {
+        console.warn('[operations] No se pudo verificar fotos compartidas; se conservan los archivos del producto:', refErr instanceof Error ? refErr.message : refErr)
+      }
+      if (stillUsed) {
+        const prefix = `operations/${trackingCode}/${productCode.replace(/[^a-zA-Z0-9._-]/g, '_')}/`
+        if (!isPrefixReferenced(prefix, stillUsed)) {
+          try {
+            const { deleteByPrefix } = await import('../lib/storage.js')
+            await deleteByPrefix(prefix)
+          } catch (e) { console.warn('[operations] Error al eliminar imágenes del producto en R2:', e instanceof Error ? e.message : e) }
+        }
+        const used = stillUsed
+        await deleteAllPhotosStorage((productToDelete.photos ?? []).filter((ph) => !isPhotoShared(ph, used)))
+      }
     }
 
     await col.updateOne({ trackingCode }, { $set: { lineaBlanca: filtered, updatedAt: new Date().toISOString() } })
