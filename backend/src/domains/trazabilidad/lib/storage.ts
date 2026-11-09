@@ -167,6 +167,27 @@ export async function refreshPhotoUrls<T extends { fileId?: string; driveUrl?: s
   return Promise.all(photos.map((p) => refreshPhotoUrl(p)))
 }
 
+/**
+ * Recorre los objetos del bucket bajo `prefix` ('' = todo), página a página,
+ * con su fecha de última modificación. No carga el listado completo en memoria.
+ */
+export async function* listObjects(prefix: string): AsyncGenerator<{ key: string; lastModified?: Date }> {
+  const client = getClient()
+  const bucket = getBucket()
+  let token: string | undefined
+  do {
+    const list = await client.send(new ListObjectsV2Command({
+      Bucket: bucket,
+      ...(prefix ? { Prefix: prefix } : {}),
+      ContinuationToken: token,
+    }))
+    for (const obj of list.Contents ?? []) {
+      if (obj.Key) yield { key: obj.Key, lastModified: obj.LastModified }
+    }
+    token = list.IsTruncated ? list.NextContinuationToken : undefined
+  } while (token)
+}
+
 /** Elimina un objeto del bucket. */
 export async function deleteObject(key: string): Promise<void> {
   const client = getClient()

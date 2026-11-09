@@ -371,10 +371,42 @@ settingsRouter.get('/cleanup', async (req, res) => {
     res.json({
       cleanupEnabled: doc?.cleanupEnabled === true,
       cleanupDays: typeof doc?.cleanupDays === 'number' ? doc.cleanupDays : 20,
+      // Resultado de la última ejecución (para comprobar que la limpieza corre).
+      cleanupLastRun: doc?.cleanupLastRun ?? null,
     })
   } catch (err) {
     console.error('[settings] Error al leer config cleanup:', err)
     res.status(500).json({ message: 'Error al leer configuración de limpieza.' })
+  }
+})
+
+/**
+ * POST /api/settings/cleanup/run
+ * Body: { companyId }
+ * Ejecuta YA la limpieza de la empresa con su configuración guardada y devuelve
+ * cuántos registros y archivos se eliminaron. Requiere la limpieza activa.
+ */
+settingsRouter.post('/cleanup/run', async (req, res) => {
+  const companyId = String(req.body?.companyId ?? '').trim()
+  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  // Acción destructiva: solo para la propia empresa de la sesión (o root).
+  if (req.session?.role !== 'root' && req.session?.companyId && req.session.companyId !== companyId) {
+    res.status(403).json({ message: 'No puedes ejecutar la limpieza de otra empresa.' }); return
+  }
+  try {
+    const doc = await getDb().collection(COLLECTION).findOne({ companyId })
+    if (doc?.cleanupEnabled !== true) {
+      res.status(400).json({ message: 'La limpieza automática está desactivada. Actívala y guarda primero.' })
+      return
+    }
+    const days = typeof doc.cleanupDays === 'number' && doc.cleanupDays >= 1 ? doc.cleanupDays : 20
+    const { runCleanupForCompany } = await import('../jobs/cleanupOldOperations.js')
+    const result = await runCleanupForCompany(companyId, days)
+    if (result.error) { res.status(500).json({ message: `La limpieza falló: ${result.error}`, result }); return }
+    res.json({ message: 'Limpieza ejecutada.', result })
+  } catch (err) {
+    console.error('[settings] Error al ejecutar limpieza:', err)
+    res.status(500).json({ message: 'Error al ejecutar la limpieza.' })
   }
 })
 
@@ -405,6 +437,13 @@ settingsRouter.put('/cleanup', async (req, res) => {
       },
       { upsert: true },
     )
+    // Al activarla, se ejecuta en segundo plano de inmediato (no espera al
+    // próximo barrido horario ni a que el servidor despierte).
+    if (enabled) {
+      void import('../jobs/cleanupOldOperations.js')
+        .then((m) => m.runCleanupForCompany(companyId.trim(), days))
+        .catch((e) => console.warn('[settings] Limpieza inmediata falló:', e instanceof Error ? e.message : e))
+    }
     res.json({ message: 'Configuración de limpieza guardada.', cleanupEnabled: enabled, cleanupDays: days })
   } catch (err) {
     console.error('[settings] Error al guardar config cleanup:', err)

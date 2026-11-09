@@ -103,22 +103,29 @@ export async function uploadToDrive(payload: DriveUploadPayload): Promise<DriveU
  * Borra el archivo de una foto de su almacenamiento (R2 y/o GitHub), según la
  * referencia disponible (fileId key o driveUrl). Best-effort, no lanza.
  */
-export async function deletePhotoStorage(photo: { fileId?: string; driveUrl?: string }): Promise<void> {
+export async function deletePhotoStorage(photo: { fileId?: string; driveUrl?: string }): Promise<boolean> {
   const fileId = photo.fileId
   const driveUrl = photo.driveUrl
-  // R2: fileId es una key (sin ser 'pending'/'note').
-  if (fileId && fileId !== 'pending' && fileId !== 'note' && fileId !== 'inline') {
+  const isGitHub = Boolean(driveUrl && driveUrl.includes('raw.githubusercontent.com'))
+  let deleted = false
+  // R2: fileId es una key (sin ser 'pending'/'note'). Las fotos de GitHub usan
+  // el fileId como ruta del repo, no como key de R2.
+  if (!isGitHub && fileId && fileId !== 'pending' && fileId !== 'note' && fileId !== 'inline') {
     try {
-      const { deleteObject } = await import('./storage.js')
-      await deleteObject(fileId)
+      const { deleteObject, isStorageConfigured } = await import('./storage.js')
+      if (isStorageConfigured()) {
+        await deleteObject(fileId)
+        deleted = true
+      }
     } catch (e) { console.warn('[storage] Error al eliminar de R2:', e instanceof Error ? e.message : e) }
   }
-  // GitHub: por rawUrl o por fileId-path.
-  const ref = (driveUrl && driveUrl.includes('raw.githubusercontent.com')) ? driveUrl : (fileId ?? '')
-  if (ref) {
+  // GitHub: por rawUrl.
+  if (isGitHub && driveUrl) {
     try {
       const { deleteImageFromGitHub } = await import('./github-storage.js')
-      await deleteImageFromGitHub(ref)
+      await deleteImageFromGitHub(driveUrl)
+      deleted = true
     } catch (e) { console.warn('[storage] Error al eliminar de GitHub:', e instanceof Error ? e.message : e) }
   }
+  return deleted
 }

@@ -43,6 +43,16 @@ interface ReceivedDoc {
   receivedBy: string
   receivedAt: string
   trackingCode?: string
+  /** Unidades marcadas del producto (compartidas por la empresa). */
+  quantity?: number
+  /** Tabla DATA desde la que se marcó (informativo). */
+  sheetId?: string
+}
+
+/** Cantidad efectiva: los marcados antiguos (sin campo) valen 1. */
+function qtyOf(doc: Record<string, unknown> | null | undefined): number {
+  const n = Number(doc?.quantity)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1
 }
 
 /**
@@ -59,7 +69,7 @@ receivedRouter.get('/', async (req, res) => {
     const docs = await getDb().collection(COLLECTION)
       .find({ companyId }, { projection: { _id: 0, productCodeLower: 0, companyId: 0 } })
       .toArray()
-    res.json({ received: docs })
+    res.json({ received: docs.map((d) => ({ ...d, quantity: qtyOf(d) })) })
   } catch (err) {
     console.error('[received] Error al listar:', err)
     res.status(500).json({ message: 'Error al leer los productos recibidos.' })
@@ -68,34 +78,73 @@ receivedRouter.get('/', async (req, res) => {
 
 /**
  * POST /api/received
- * Body: { companyId?, productCode, trackingCode? }
- * Marca un producto como recibido para toda la empresa (idempotente: si ya
- * estaba, actualiza quién/ cuándo). companyId y el usuario salen de la sesión.
+ * Body: { companyId?, productCode, trackingCode?, sheetId?, delta?, quantity? }
+ * Marca un producto como recibido para toda la empresa, con su CANTIDAD.
+ *  - delta (p. ej. +1 / -1): suma/resta unidades de forma atómica (varios
+ *    empleados marcando a la vez no pisan la cuenta). Si llega a 0, se desmarca.
+ *  - quantity: fija la cantidad exacta (0 = desmarcar).
+ *  - sin delta ni quantity: marca con 1 si no estaba (compatibilidad).
+ * companyId y el usuario salen de la sesión si no vienen en el body.
  */
 receivedRouter.post('/', async (req, res) => {
   const companyId = (req.body?.companyId as string) || req.session?.companyId
   const productCodeRaw = (req.body?.productCode as string) ?? ''
   const trackingCode = (req.body?.trackingCode as string) || undefined
+  const sheetId = (req.body?.sheetId as string) || undefined
   const productCode = productCodeRaw.trim()
   if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
   if (!productCode) { res.status(400).json({ message: 'productCode es requerido.' }); return }
 
-  const doc: ReceivedDoc = {
+  const rawDelta = req.body?.delta
+  const rawQty = req.body?.quantity
+  const delta = rawDelta === undefined || rawDelta === null ? null : Math.trunc(Number(rawDelta))
+  const setQty = rawQty === undefined || rawQty === null ? null : Math.trunc(Number(rawQty))
+  if ((delta !== null && !Number.isFinite(delta)) || (setQty !== null && (!Number.isFinite(setQty) || setQty < 0))) {
+    res.status(400).json({ message: 'delta/quantity deben ser números válidos.' }); return
+  }
+
+  const key = { companyId, productCodeLower: productCode.toLowerCase() }
+  const meta = {
     companyId,
     productCode,
-    productCodeLower: productCode.toLowerCase(),
+    productCodeLower: key.productCodeLower,
     receivedBy: req.session?.user ?? 'desconocido',
     receivedAt: new Date().toISOString(),
-    trackingCode,
+    ...(trackingCode ? { trackingCode } : {}),
+    ...(sheetId ? { sheetId } : {}),
   }
 
   try {
     await ensureIndex()
-    await getDb().collection(COLLECTION).updateOne(
-      { companyId, productCodeLower: doc.productCodeLower },
-      { $set: doc },
-      { upsert: true },
-    )
+    const col = getDb().collection(COLLECTION)
+    let quantity: number
+
+    if (setQty !== null) {
+      quantity = setQty
+      if (quantity > 0) await col.updateOne(key, { $set: { ...meta, quantity } }, { upsert: true })
+    } else if (delta !== null && delta !== 0) {
+      // Los marcados antiguos no tienen `quantity` (valían 1): se normalizan
+      // antes de sumar para que $inc parta de 1 y no de 0.
+      await col.updateOne({ ...key, quantity: { $exists: false } }, { $set: { quantity: 1 } })
+      const after = await col.findOneAndUpdate(
+        key,
+        { $inc: { quantity: delta }, $set: meta },
+        { upsert: true, returnDocument: 'after' },
+      )
+      quantity = Number((after as { quantity?: number } | null)?.quantity ?? delta)
+    } else {
+      await col.updateOne(key, { $set: meta, $setOnInsert: { quantity: 1 } }, { upsert: true })
+      quantity = qtyOf(await col.findOne(key, { projection: { quantity: 1 } }))
+    }
+
+    // 0 o menos → ya no está marcado.
+    if (quantity <= 0) {
+      await col.deleteOne(key)
+      res.json({ message: 'Producto desmarcado.', removed: true, received: { productCode, quantity: 0 } })
+      return
+    }
+
+    const doc: ReceivedDoc = { ...meta, quantity }
     res.json({
       message: 'Producto marcado como recibido.',
       received: {
@@ -103,6 +152,8 @@ receivedRouter.post('/', async (req, res) => {
         receivedBy: doc.receivedBy,
         receivedAt: doc.receivedAt,
         trackingCode: doc.trackingCode,
+        sheetId: doc.sheetId,
+        quantity,
       },
     })
   } catch (err) {
