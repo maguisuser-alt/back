@@ -303,6 +303,9 @@ sheetsRouter.get('/:id', async (req, res) => {
       rowsTruncated: doc.rowsTruncated === true,
       source: 'stored',
       createdAt: doc.createdAt,
+      updatedAt: doc.updatedAt,
+      // true si el último guardado no llegó a Google Sheets (ver POST /:id/sync).
+      syncPending: doc.syncPending === true,
     })
   } catch (err) {
     console.error('[sheets] Error al leer hoja:', err)
@@ -513,6 +516,9 @@ sheetsRouter.put('/:id/rows', async (req, res) => {
     }
 
     const hasSheet = Boolean(doc.sheetId)
+    // Si la copia a Google Sheets falló, se deja marcado para avisar y reintentar.
+    const syncPending = hasSheet && !sheetUpdated
+    await col.updateOne({ id, companyId: companyId.trim() }, { $set: { syncPending } })
     res.json({
       message: !hasSheet
         ? 'Cambios guardados en la app.'
@@ -521,10 +527,59 @@ sheetsRouter.put('/:id/rows', async (req, res) => {
           : 'Cambios guardados en la app. No se pudo sincronizar con Google Sheets.',
       rowCount: cleanRows.length,
       sheetUpdated,
+      syncPending,
     })
   } catch (err) {
     console.error('[sheets] Error al guardar filas:', err)
     res.status(500).json({ message: 'Error al guardar los cambios.' })
+  }
+})
+
+/**
+ * POST /api/sheets/:id/sync
+ * Body: { companyId }
+ * Reintenta copiar a Google Sheets la versión guardada en la app (la que tiene
+ * los cambios). Limpia `syncPending` si lo logra.
+ */
+sheetsRouter.post('/:id/sync', async (req, res) => {
+  const { id } = req.params
+  const companyId = String(req.body?.companyId ?? '').trim()
+  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  try {
+    const col = getDb().collection(COLLECTION)
+    const doc = await col.findOne({ id, companyId })
+    if (!doc) { res.status(404).json({ message: 'Hoja no encontrada.' }); return }
+    if (!doc.sheetId) {
+      await col.updateOne({ id, companyId }, { $set: { syncPending: false } })
+      res.json({ message: 'Esta tabla no está vinculada a Google Sheets.', sheetUpdated: false, syncPending: false })
+      return
+    }
+    const GAS_URL = process.env.GAS_WEBHOOK_URL ?? ''
+    if (!GAS_URL) {
+      res.status(502).json({ message: 'GAS_WEBHOOK_URL no está configurado en el servidor: no se puede sincronizar con Google Sheets.', syncPending: true })
+      return
+    }
+    let sheetUpdated = false
+    let detail = ''
+    try {
+      const data = await callGas(GAS_URL, {
+        action: 'updateSheet', sheetId: doc.sheetId,
+        headers: (doc.columns as string[]) ?? [], rows: (doc.rows as string[][]) ?? [],
+      })
+      sheetUpdated = data.status === 'success'
+      if (!sheetUpdated) detail = String((data as { message?: string }).message ?? '')
+    } catch (e) {
+      detail = e instanceof Error ? e.message : String(e)
+    }
+    await col.updateOne({ id, companyId }, { $set: { syncPending: !sheetUpdated } })
+    if (!sheetUpdated) {
+      res.status(502).json({ message: `No se pudo sincronizar con Google Sheets${detail ? `: ${detail}` : '.'}`, sheetUpdated: false, syncPending: true })
+      return
+    }
+    res.json({ message: 'Tabla sincronizada con Google Sheets.', sheetUpdated: true, syncPending: false })
+  } catch (err) {
+    console.error('[sheets] Error al sincronizar:', err)
+    res.status(500).json({ message: 'Error al sincronizar con Google Sheets.' })
   }
 })
 

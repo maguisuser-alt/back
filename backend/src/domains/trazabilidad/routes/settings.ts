@@ -287,7 +287,13 @@ settingsRouter.get('/locations/by-vehicle/:placa/products', async (req, res) => 
 
 // ── Ajustes de Base de datos (DATA) por compañía ────────────────────────
 /** Configuración de columnas de una tabla (sheet). */
-type SheetColumnSettings = { codeColumn: number; descColumn: number; extraColumns: number[] }
+type SheetColumnSettings = {
+  codeColumn: number
+  descColumn: number
+  extraColumns: number[]
+  /** Columna con la cantidad ESPERADA del producto (−1 = ninguna). */
+  expectedColumn: number
+}
 /** Ajustes de la DATA de la empresa: tabla principal + columnas por tabla. */
 type DbSettings = {
   primarySheetId?: string
@@ -305,10 +311,12 @@ function sanitizeDbSettings(raw: unknown): DbSettings {
     const code = Number(c.codeColumn)
     const desc = Number(c.descColumn)
     const extra = Array.isArray(c.extraColumns) ? c.extraColumns.map(Number).filter((n) => Number.isFinite(n) && n >= 0) : []
+    const expected = c.expectedColumn === undefined || c.expectedColumn === null ? -1 : Number(c.expectedColumn)
     columns[sheetId] = {
       codeColumn: Number.isFinite(code) && code >= 0 ? code : 0,
       descColumn: Number.isFinite(desc) ? desc : -1,
       extraColumns: extra,
+      expectedColumn: Number.isFinite(expected) && expected >= 0 ? expected : -1,
     }
   }
   return {
