@@ -39,10 +39,12 @@ async function ensureIndex() {
     const db = getDb()
     const col = db.collection(COLLECTION)
     await col.updateMany({ scope: { $exists: false } }, { $set: { scope: '' } })
+    await col.updateMany({ rowKey: { $exists: false } }, { $set: { rowKey: '' } })
     try { await col.dropIndex('company_product_unique') } catch { /* no existía */ }
+    try { await col.dropIndex('company_scope_product_unique') } catch { /* no existía */ }
     await col.createIndex(
-      { companyId: 1, scope: 1, productCodeLower: 1 },
-      { unique: true, name: 'company_scope_product_unique' },
+      { companyId: 1, scope: 1, productCodeLower: 1, rowKey: 1 },
+      { unique: true, name: 'company_scope_product_row_unique' },
     )
     await db.collection(HISTORY).createIndex({ companyId: 1, scope: 1, productCodeLower: 1, at: -1 }, { name: 'history_lookup' })
     await db.collection(HISTORY).createIndex({ id: 1 }, { unique: true, name: 'history_id_unique' })
@@ -67,6 +69,16 @@ interface ReceivedDoc {
   quantity?: number
   /** Tabla DATA desde la que se marcó (informativo). */
   sheetId?: string
+  /**
+   * Fila concreta cuando el código se REPITE en la tabla (p. ej. "sheet:2" =
+   * 2.ª fila con ese código). '' = marca del código (código único).
+   */
+  rowKey: string
+}
+
+/** Fila normalizada ('' = código). */
+function rowKeyOf(v: unknown): string {
+  return typeof v === 'string' ? v.trim().slice(0, 120) : ''
 }
 
 interface HistoryDoc {
@@ -75,6 +87,7 @@ interface HistoryDoc {
   scope: string
   productCode: string
   productCodeLower: string
+  rowKey?: string
   /** Cantidad antes y después del cambio. */
   before: number
   after: number
@@ -124,20 +137,22 @@ async function applyChange(params: {
   companyId: string
   scope: string
   productCode: string
+  rowKey?: string
   delta?: number | null
   setQty?: number | null
   user: string
   trackingCode?: string
   sheetId?: string
 }): Promise<{ before: number; after: number; doc: ReceivedDoc }> {
-  const { companyId, scope, productCode, delta = null, setQty = null, user, trackingCode, sheetId } = params
+  const { companyId, scope, productCode, rowKey = '', delta = null, setQty = null, user, trackingCode, sheetId } = params
   const col = getDb().collection(COLLECTION)
-  const key = { companyId, scope, productCodeLower: productCode.toLowerCase() }
+  const key = { companyId, scope, productCodeLower: productCode.toLowerCase(), rowKey }
   const meta: ReceivedDoc = {
     companyId,
     scope,
     productCode,
     productCodeLower: key.productCodeLower,
+    rowKey,
     receivedBy: user,
     receivedAt: new Date().toISOString(),
     ...(trackingCode ? { trackingCode } : {}),
@@ -207,6 +222,7 @@ receivedRouter.post('/', async (req, res) => {
   const productCode = String(req.body?.productCode ?? '').trim()
   const trackingCode = (req.body?.trackingCode as string) || undefined
   const sheetId = (req.body?.sheetId as string) || undefined
+  const rowKey = rowKeyOf(req.body?.rowKey)
   if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
   if (!productCode) { res.status(400).json({ message: 'productCode es requerido.' }); return }
 
@@ -224,17 +240,17 @@ receivedRouter.post('/', async (req, res) => {
       res.status(409).json({ message: 'Esta recepción está cerrada. Reábrela para seguir marcando.' }); return
     }
     const user = req.session?.user ?? 'desconocido'
-    const { before, after, doc } = await applyChange({ companyId, scope, productCode, delta, setQty, user, trackingCode, sheetId })
+    const { before, after, doc } = await applyChange({ companyId, scope, productCode, rowKey, delta, setQty, user, trackingCode, sheetId })
     const historyId = before === after
       ? undefined
       : await logHistory({
-        companyId, scope, productCode, productCodeLower: doc.productCodeLower,
+        companyId, scope, productCode, productCodeLower: doc.productCodeLower, rowKey,
         before, after, user, at: doc.receivedAt, action: after > 0 ? 'mark' : 'unmark',
         ...(trackingCode ? { trackingCode } : {}), ...(sheetId ? { sheetId } : {}),
       })
 
     if (after <= 0) {
-      res.json({ message: 'Producto desmarcado.', removed: true, historyId, received: { productCode, scope, quantity: 0 } })
+      res.json({ message: 'Producto desmarcado.', removed: true, historyId, received: { productCode, scope, rowKey, quantity: 0 } })
       return
     }
     res.json({
@@ -243,6 +259,7 @@ receivedRouter.post('/', async (req, res) => {
       received: {
         productCode: doc.productCode,
         scope,
+        rowKey,
         receivedBy: doc.receivedBy,
         receivedAt: doc.receivedAt,
         trackingCode: doc.trackingCode,
@@ -269,7 +286,10 @@ receivedRouter.get('/history', async (req, res) => {
   try {
     await ensureIndex()
     const filter: Record<string, unknown> = { companyId, scope }
-    if (productCode) filter.productCodeLower = productCode.toLowerCase()
+    if (productCode) {
+      filter.productCodeLower = productCode.toLowerCase()
+      filter.rowKey = rowKeyOf(req.query.rowKey) || { $in: ['', null] }
+    }
     const items = await getDb().collection(HISTORY)
       .find(filter, { projection: { _id: 0, companyId: 0, productCodeLower: 0 } })
       .sort({ at: -1 })
@@ -310,14 +330,15 @@ receivedRouter.post('/undo', async (req, res) => {
 
     const user = req.session?.user ?? 'desconocido'
     const inverse = entry.before - entry.after
+    const entryRow = entry.rowKey ?? ''
     const { before, after } = await applyChange({
-      companyId, scope: entry.scope ?? '', productCode: entry.productCode, delta: inverse, user,
+      companyId, scope: entry.scope ?? '', productCode: entry.productCode, rowKey: entryRow, delta: inverse, user,
     })
     await logHistory({
-      companyId, scope: entry.scope ?? '', productCode: entry.productCode, productCodeLower: entry.productCodeLower,
+      companyId, scope: entry.scope ?? '', productCode: entry.productCode, productCodeLower: entry.productCodeLower, rowKey: entryRow,
       before, after, user, at: new Date().toISOString(), action: 'undo', undoOf: historyId,
     })
-    res.json({ message: 'Cambio deshecho.', received: { productCode: entry.productCode, scope: entry.scope ?? '', quantity: after } })
+    res.json({ message: 'Cambio deshecho.', received: { productCode: entry.productCode, scope: entry.scope ?? '', rowKey: entryRow, quantity: after } })
   } catch (err) {
     console.error('[received] Error al deshacer:', err)
     res.status(500).json({ message: 'Error al deshacer el cambio.' })
@@ -337,10 +358,11 @@ receivedRouter.delete('/:productCode', async (req, res) => {
   try {
     await ensureIndex()
     const user = req.session?.user ?? 'desconocido'
-    const { before, after } = await applyChange({ companyId, scope, productCode, setQty: 0, user })
+    const rowKey = rowKeyOf(req.query.rowKey ?? req.body?.rowKey)
+    const { before, after } = await applyChange({ companyId, scope, productCode, rowKey, setQty: 0, user })
     if (before !== after) {
       await logHistory({
-        companyId, scope, productCode, productCodeLower: productCode.toLowerCase(),
+        companyId, scope, productCode, productCodeLower: productCode.toLowerCase(), rowKey,
         before, after, user, at: new Date().toISOString(), action: 'unmark',
       })
     }
