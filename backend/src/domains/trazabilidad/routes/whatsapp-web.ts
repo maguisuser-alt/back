@@ -19,6 +19,7 @@ import {
   listGroups, resolveGroupInvite, clearSession, toJid, sendAudio, sendDocument,
 } from '../lib/whatsapp-web.js'
 import { isGitHubConfigured } from '../lib/github-storage.js'
+import { createChatQueue } from '../lib/chat-queue.js'
 import { shouldForwardToTurnos } from '../lib/turnos-link.js'
 
 export const whatsappWebRouter = Router()
@@ -46,14 +47,32 @@ function pruneRecentSends(): void {
   }
 }
 
-/** Ejecuta un envío una sola vez por clave; devuelve el resultado ya producido. */
-async function sendOnce<T>(key: string, run: () => Promise<T>): Promise<{ data: T; deduped: boolean }> {
+/**
+ * COLA POR CHAT: los envíos a un mismo chat salen uno detrás de otro (cada uno
+ * completo: encabezado, álbum, textos), así dos envíos lanzados a la vez no se
+ * mezclan en el chat y no se dispara una ráfaga desde el mismo número. Envíos a
+ * chats distintos siguen saliendo en paralelo. Un error en un envío no frena
+ * los que esperan detrás.
+ */
+// Mismo chat aunque llegue escrito distinto ("+57 300…", "57300…", JID).
+const chatQueue = createChatQueue((c) => toJid(c).toLowerCase())
+
+function enqueueForChat<T>(chat: string, run: () => Promise<T>): Promise<T> {
+  return chatQueue.enqueue(chat, run)
+}
+
+/**
+ * Ejecuta un envío una sola vez por clave; devuelve el resultado ya producido.
+ * El envío entra en la cola de su chat (`chat`, o el 3.er segmento de la clave
+ * `tipo|registro|chat|…`).
+ */
+async function sendOnce<T>(key: string, run: () => Promise<T>, chat = key.split('|')[2] ?? ''): Promise<{ data: T; deduped: boolean }> {
   pruneRecentSends()
   const recent = recentSends.get(key)
   if (recent) return { data: recent.data as T, deduped: true }
   const running = inFlightSends.get(key)
   if (running) return { data: (await running) as T, deduped: true }
-  const started = run()
+  const started = enqueueForChat(chat, run)
   inFlightSends.set(key, started)
   try {
     const data = await started
@@ -319,9 +338,9 @@ whatsappWebRouter.post('/send', async (req, res) => {
   }
 
   try {
-    const result = imageUrl
-      ? await sendImage(to, imageUrl, caption, companyId, userId)
-      : await sendText(to, text, companyId, userId)
+    const result = await enqueueForChat(to, () => (imageUrl
+      ? sendImage(to, imageUrl, caption, companyId, userId)
+      : sendText(to, text, companyId, userId)))
 
     try {
       await getDb().collection(COLLECTION).insertOne({
@@ -356,7 +375,7 @@ whatsappWebRouter.post('/send-github', async (req, res) => {
   if (!isGitHubConfigured()) { res.status(502).json({ message: 'GitHub no está configurado en el servidor (GITHUB_TOKEN/OWNER/REPO).' }); return }
 
   try {
-    const result = await sendImageFromGitHub(to, base64, caption, { path, fileName }, companyId, userId)
+    const result = await enqueueForChat(to, () => sendImageFromGitHub(to, base64, caption, { path, fileName }, companyId, userId))
     try {
       await getDb().collection(COLLECTION).insertOne({
         direction: 'outbound',
@@ -841,7 +860,7 @@ whatsappWebRouter.post('/send-audio', async (req, res) => {
     }
     if (!to) { res.status(400).json({ message: 'No hay destino de WhatsApp configurado para esta empresa.' }); return }
 
-    const r = await uSendAudio(to, audioUrl, companyId, mimetype, userId)
+    const r = await enqueueForChat(to, () => uSendAudio(to, audioUrl, companyId, mimetype, userId))
     res.json({ message: 'Audio enviado a WhatsApp.', to, id: r.id })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar audio:', err)
@@ -873,7 +892,7 @@ whatsappWebRouter.post('/send-document', async (req, res) => {
     }
     if (!to) { res.status(400).json({ message: 'No hay destino de WhatsApp configurado para esta empresa.' }); return }
 
-    const r = await uSendDocument(to, documentUrl, { fileName, caption, mimetype }, companyId, userId)
+    const r = await enqueueForChat(to, () => uSendDocument(to, documentUrl, { fileName, caption, mimetype }, companyId, userId))
     res.json({ message: 'Documento enviado a WhatsApp.', to, id: r.id })
   } catch (err) {
     console.error('[whatsapp-web] Error al enviar documento:', err)
