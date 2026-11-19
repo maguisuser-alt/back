@@ -10,6 +10,8 @@ export type SheetColumnSettings = {
   extraColumns: number[]
   /** Columna con la cantidad ESPERADA del producto (−1 = ninguna). */
   expectedColumn: number
+  /** Qué es la cantidad marcada: piezas (indicativo) o unidades contra lo esperado. */
+  qtyMode?: 'pieces' | 'expected'
 }
 
 /** Ajustes de la DATA de la empresa: tabla principal + columnas por tabla. */
@@ -38,6 +40,7 @@ export function sanitizeDbSettings(raw: unknown): DbSettings {
       descColumn: Number.isFinite(desc) ? desc : -1,
       extraColumns: extra,
       expectedColumn: Number.isFinite(expected) && expected >= 0 ? expected : -1,
+      ...(c.qtyMode === 'pieces' || c.qtyMode === 'expected' ? { qtyMode: c.qtyMode } : {}),
     }
   }
   return {

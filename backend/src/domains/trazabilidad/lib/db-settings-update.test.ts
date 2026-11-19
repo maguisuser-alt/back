@@ -39,6 +39,12 @@ test('ignora ids que romperían la ruta de Mongo', () => {
   assert.deepEqual(Object.keys($set), ['dbSettings.columns.ok_1'])
 })
 
+test('sanitizeDbSettings: conserva el modo de cantidad válido y descarta otros', () => {
+  const s = sanitizeDbSettings({ columns: { a: { ...cols, qtyMode: 'expected' }, b: { ...cols, qtyMode: 'x' } } })
+  assert.equal(s.columns.a.qtyMode, 'expected')
+  assert.equal('qtyMode' in s.columns.b, false)
+})
+
 test('sanitizeDbSettings: valores inválidos quedan en los valores por defecto', () => {
   const s = sanitizeDbSettings({ columns: { t: { codeColumn: -3, descColumn: 'x', extraColumns: [1, -1, 'a'] } } })
   assert.deepEqual(s.columns.t, { codeColumn: 0, descColumn: -1, extraColumns: [1], expectedColumn: -1 })
