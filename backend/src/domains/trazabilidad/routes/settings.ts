@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { getDb, getOperationsCollection, getMovementsCollection } from '../lib/mongodb.js'
+import { buildDbSettingsUpdate, sanitizeDbSettings } from '../lib/db-settings-update.js'
 import {
   FEATURE_KEYS, DEFAULT_OPERATION_TYPES_LIMIT, TURNOS_API_URL,
   readAllowed, type FeatureKey,
@@ -286,45 +287,7 @@ settingsRouter.get('/locations/by-vehicle/:placa/products', async (req, res) => 
 })
 
 // ── Ajustes de Base de datos (DATA) por compañía ────────────────────────
-/** Configuración de columnas de una tabla (sheet). */
-type SheetColumnSettings = {
-  codeColumn: number
-  descColumn: number
-  extraColumns: number[]
-  /** Columna con la cantidad ESPERADA del producto (−1 = ninguna). */
-  expectedColumn: number
-}
-/** Ajustes de la DATA de la empresa: tabla principal + columnas por tabla. */
-type DbSettings = {
-  primarySheetId?: string
-  primarySheetName?: string
-  columns: Record<string, SheetColumnSettings>
-}
-
-/** Normaliza/valida los ajustes de DATA recibidos del cliente. */
-function sanitizeDbSettings(raw: unknown): DbSettings {
-  const obj = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
-  const columnsIn = (obj.columns && typeof obj.columns === 'object' ? obj.columns : {}) as Record<string, unknown>
-  const columns: Record<string, SheetColumnSettings> = {}
-  for (const [sheetId, v] of Object.entries(columnsIn)) {
-    const c = (v && typeof v === 'object' ? v : {}) as Record<string, unknown>
-    const code = Number(c.codeColumn)
-    const desc = Number(c.descColumn)
-    const extra = Array.isArray(c.extraColumns) ? c.extraColumns.map(Number).filter((n) => Number.isFinite(n) && n >= 0) : []
-    const expected = c.expectedColumn === undefined || c.expectedColumn === null ? -1 : Number(c.expectedColumn)
-    columns[sheetId] = {
-      codeColumn: Number.isFinite(code) && code >= 0 ? code : 0,
-      descColumn: Number.isFinite(desc) ? desc : -1,
-      extraColumns: extra,
-      expectedColumn: Number.isFinite(expected) && expected >= 0 ? expected : -1,
-    }
-  }
-  return {
-    primarySheetId: typeof obj.primarySheetId === 'string' ? obj.primarySheetId : undefined,
-    primarySheetName: typeof obj.primarySheetName === 'string' ? obj.primarySheetName : undefined,
-    columns,
-  }
-}
+// Validación y combinación en lib/db-settings-update.ts (funciones puras).
 
 /**
  * GET /api/settings/db?companyId=xxx
@@ -346,20 +309,34 @@ settingsRouter.get('/db', async (req, res) => {
 
 /**
  * PUT /api/settings/db
- * Body: { companyId, primarySheetId?, primarySheetName?, columns: { [sheetId]: {...} } }
- * Guarda la configuración COMPLETA de la DATA de la empresa.
+ * Body: { companyId, columns?: { [sheetId]: {...} }, primary?: { id: string | null, name?: string } }
+ *   (compatibilidad: también acepta primarySheetId / primarySheetName sueltos)
+ *
+ * COMBINA con lo guardado: solo cambia las tablas que vienen en `columns` y la
+ * tabla principal si viene `primary`. Antes reemplazaba TODO con lo que tuviera
+ * el dispositivo que guardaba: una PDA recién abierta (sin los ajustes cargados)
+ * borraba las columnas de las demás tablas al tocar una. Esa era la causa de
+ * que la configuración de columnas "se desconfigurara".
  */
 settingsRouter.put('/db', async (req, res) => {
-  const { companyId } = req.body ?? {}
-  if (!companyId?.trim()) { res.status(400).json({ message: 'companyId es requerido.' }); return }
-  const clean = sanitizeDbSettings(req.body)
+  const body = (req.body ?? {}) as Record<string, unknown>
+  const companyId = typeof body.companyId === 'string' ? body.companyId.trim() : ''
+  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  const { $set, $unset } = buildDbSettingsUpdate(body)
   try {
-    await getDb().collection(COLLECTION).updateOne(
-      { companyId: companyId.trim() },
-      { $set: { companyId: companyId.trim(), dbSettings: clean, updatedAt: new Date().toISOString() } },
+    const col = getDb().collection(COLLECTION)
+    // Documentos antiguos con dbSettings/columns que no son objeto: se reparan
+    // para que la actualización por ruta (dbSettings.columns.<id>) no falle.
+    await col.updateOne({ companyId, dbSettings: { $exists: true, $not: { $type: 'object' } } }, { $set: { dbSettings: { columns: {} } } })
+    await col.updateOne({ companyId, 'dbSettings.columns': { $exists: true, $not: { $type: 'object' } } }, { $set: { 'dbSettings.columns': {} } })
+    await col.updateOne(
+      { companyId },
+      { $set: { companyId, updatedAt: new Date().toISOString(), ...$set }, ...(Object.keys($unset).length ? { $unset } : {}) },
       { upsert: true },
     )
-    res.json({ message: 'Ajustes de base de datos guardados.', ...clean })
+    const doc = await col.findOne({ companyId }) as Record<string, unknown> | null
+    const saved = doc?.dbSettings ? sanitizeDbSettings(doc.dbSettings) : { columns: {} }
+    res.json({ message: 'Ajustes de base de datos guardados.', ...saved })
   } catch (err) {
     console.error('[settings] Error al guardar dbSettings:', err)
     res.status(500).json({ message: 'Error al guardar los ajustes de base de datos.' })
