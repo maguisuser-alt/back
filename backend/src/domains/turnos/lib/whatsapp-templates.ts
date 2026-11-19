@@ -11,10 +11,13 @@
 import { getDb } from './mongodb.js'
 import { sendText, sendListMessage, sendButtonsMessage } from './whatsapp-turnos.js'
 import { DEFAULT_CONFIG } from '../routes/whatsapp-config.js'
+import { sanitizeCustom } from './whatsapp-custom.js'
 
 const CONFIG_COLLECTION = 'whatsapp_turnos_config'
 
 export type TemplateKey = 'turno_confirmacion' | 'turno_recordatorio' | 'clase_recordatorio'
+/** Predefinida o creada por la empresa (`custom:<id>`). */
+export type SendableTemplate = TemplateKey | `custom:${string}`
 
 export type TemplateVars = {
   nombre?: string
@@ -57,7 +60,18 @@ export function normalizePhone(raw: string): string {
  * Si la empresa no tiene config guardada (o le falta ese tipo), usa la
  * plantilla por defecto, de modo que el envío nunca falla por "no configurada".
  */
-async function getMessageConfig(companyId: string, tipo: TemplateKey): Promise<MessageConfig> {
+async function getMessageConfig(companyId: string, tipoIn: SendableTemplate): Promise<MessageConfig> {
+  // Plantilla propia de la empresa: si no existe, se usa la confirmación.
+  if (tipoIn.startsWith('custom:')) {
+    const id = tipoIn.slice('custom:'.length)
+    try {
+      const db = await getDb()
+      const doc = await db.collection(CONFIG_COLLECTION).findOne({ companyId }) as Record<string, unknown> | null
+      const found = sanitizeCustom(doc?.custom).find((t) => t.id === id)
+      if (found) return { enabled: found.enabled, template: found.template, options: found.options }
+    } catch { /* usa la confirmación */ }
+  }
+  const tipo: TemplateKey = tipoIn.startsWith('custom:') ? 'turno_confirmacion' : tipoIn as TemplateKey
   const fallback = DEFAULT_CONFIG[tipo]
   const base: MessageConfig = {
     enabled: fallback.enabled,
@@ -93,7 +107,7 @@ export type SendTemplateResult = {
  */
 export async function sendTemplate(
   companyId: string,
-  tipo: TemplateKey,
+  tipo: SendableTemplate,
   phone: string,
   vars: TemplateVars,
   overrideTemplate?: string,

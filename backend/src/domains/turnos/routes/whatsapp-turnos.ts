@@ -22,8 +22,9 @@ import {
   sendButtonsMessage, sendImage, sendAlbum, sendDocument, sendAudio,
   listGroups, clearSession, toJid,
 } from '../lib/whatsapp-turnos.js'
-import { sendTemplate, interpolate, type TemplateKey, type TemplateVars } from '../lib/whatsapp-templates.js'
+import { sendTemplate, interpolate, type SendableTemplate, type TemplateKey, type TemplateVars } from '../lib/whatsapp-templates.js'
 import { DEFAULT_CONFIG } from './whatsapp-config.js'
+import { sanitizeCustom } from '../lib/whatsapp-custom.js'
 import { getDb } from '../lib/mongodb.js'
 import { readDatabase } from '../lib/database.js'
 
@@ -273,12 +274,14 @@ whatsappTurnosRouter.get('/turn-template', async (req, res) => {
     // Plantilla: la de la empresa si existe, si no la de por defecto.
     let template = DEFAULT_CONFIG.turno_confirmacion.template
     let options = DEFAULT_CONFIG.turno_confirmacion.options
+    let custom: ReturnType<typeof sanitizeCustom> = []
     try {
       const mdb = await getDb()
       const doc = await mdb.collection('whatsapp_turnos_config').findOne({ companyId: turn.companyId }) as Record<string, unknown> | null
       const cfg = doc?.turno_confirmacion as { template?: string; options?: { id: string; label: string }[] } | undefined
       if (cfg?.template?.trim()) template = cfg.template
       if (Array.isArray(cfg?.options)) options = cfg.options
+      custom = sanitizeCustom(doc?.custom).filter((t) => t.enabled && t.template.trim())
     } catch { /* usa default */ }
 
     const vars = buildTurnVars(turn, worker, location)
@@ -286,6 +289,11 @@ whatsappTurnosRouter.get('/turn-template', async (req, res) => {
       template,
       vars,
       options,
+      // Plantillas que se pueden elegir en el modal: la de confirmación y las propias activas.
+      templates: [
+        { id: 'turno_confirmacion', name: 'Confirmación de asistencia', template, options },
+        ...custom.map((t) => ({ id: `custom:${t.id}`, name: t.name, template: t.template, options: t.options })),
+      ],
       preview: interpolate(template, vars),
       telefono: worker?.telefono ?? '',
       placeholders: ['nombre', 'cargo', 'fecha', 'hora', 'ubicacion', 'mapa', 'link'],
@@ -302,7 +310,7 @@ whatsappTurnosRouter.get('/turn-template', async (req, res) => {
  * Body: { turnId, to?, message? }  (message = plantilla editada opcional)
  */
 whatsappTurnosRouter.post('/send-turn-confirmation', async (req, res) => {
-  const { turnId, to, message } = req.body ?? {}
+  const { turnId, to, message, templateId } = req.body ?? {}
   const userId = reqUserId(req)
   if (!turnId) { res.status(400).json({ message: 'turnId es requerido.' }); return }
 
@@ -322,7 +330,11 @@ whatsappTurnosRouter.post('/send-turn-confirmation', async (req, res) => {
     const location = turn.locationId ? db.locations.find((l) => l.id === turn.locationId) : undefined
     const vars = buildTurnVars(turn, worker, location)
     const override = typeof message === 'string' && message.trim() ? message : undefined
-    const result = await sendTemplate(turn.companyId, 'turno_confirmacion', destino, vars, override, userId)
+    // Plantilla elegida en el modal (sus botones de respuesta); por defecto la confirmación.
+    const tipo: SendableTemplate = typeof templateId === 'string' && /^custom:[\w-]{1,40}$/.test(templateId)
+      ? templateId as SendableTemplate
+      : 'turno_confirmacion'
+    const result = await sendTemplate(turn.companyId, tipo, destino, vars, override, userId)
     if (!result.sent) { res.status(409).json({ message: result.reason ?? 'No se pudo enviar.' }); return }
     res.json({ message: 'Confirmación de turno enviada.', id: result.id, text: result.text })
   } catch (err) {

@@ -11,14 +11,41 @@
  *  - turno_recordatorio  → Recordatorio de turno de trabajo
  *  - clase_recordatorio  → Recordatorio de asistencia de clase
  *
+ * Además, `custom`: plantillas creadas por la empresa (máx. 20), que se
+ * pueden elegir al enviar la confirmación de un turno.
+ *
  * GET  /api/whatsapp-config?companyId=xxx        → devuelve la configuración
  * PUT  /api/whatsapp-config                       → guarda la configuración
  */
 
-import { Router } from 'express'
+import { Router, type Request, type Response } from 'express'
 import { getDb } from '../lib/mongodb.js'
+import { readDatabase } from '../lib/database.js'
+import { requireAuth, requireRole } from '../middleware/auth.js'
+import { sanitizeCustom, type CustomTemplate } from '../lib/whatsapp-custom.js'
+
+export { sanitizeCustom, type CustomTemplate }
 
 export const whatsappConfigRouter = Router()
+
+// Antes no exigía sesión: cualquiera con un companyId podía leer o cambiar las
+// plantillas de esa empresa. Ahora solo usuarios de la propia empresa.
+whatsappConfigRouter.use(requireAuth)
+
+/** companyId de la sesión; si el cliente manda otro distinto, se rechaza. */
+async function resolveOwnCompany(req: Request, res: Response, requested: unknown): Promise<string | null> {
+  let own = req.authUser?.companyId ?? ''
+  if (!own) {
+    const db = await readDatabase()
+    own = db.users.find((u) => u.id === req.authUser?.userId)?.companyId ?? ''
+  }
+  const asked = typeof requested === 'string' ? requested.trim() : ''
+  if (!own || (asked && asked !== own)) {
+    res.status(403).json({ message: 'No puedes ver ni cambiar la configuración de otra empresa.' })
+    return null
+  }
+  return own
+}
 
 const COLLECTION = 'whatsapp_turnos_config'
 
@@ -38,8 +65,11 @@ export type WhatsAppConfig = {
   turno_confirmacion: WhatsAppMessageConfig
   turno_recordatorio: WhatsAppMessageConfig
   clase_recordatorio: WhatsAppMessageConfig
+  custom: CustomTemplate[]
   updatedAt?: string
 }
+
+
 
 type ConfigKey = 'turno_confirmacion' | 'turno_recordatorio' | 'clase_recordatorio'
 
@@ -82,8 +112,9 @@ export const DEFAULT_CONFIG: Record<ConfigKey, WhatsAppMessageConfig> = {
 }
 
 function mergeWithDefaults(doc: Record<string, unknown> | null, companyId: string): WhatsAppConfig {
-  const base: WhatsAppConfig = { companyId, ...DEFAULT_CONFIG }
+  const base: WhatsAppConfig = { companyId, ...DEFAULT_CONFIG, custom: [] }
   if (!doc) return base
+  base.custom = sanitizeCustom(doc.custom)
   for (const key of CONFIG_KEYS) {
     const incoming = doc[key] as Partial<WhatsAppMessageConfig> | undefined
     if (incoming) {
@@ -98,8 +129,8 @@ function mergeWithDefaults(doc: Record<string, unknown> | null, companyId: strin
 }
 
 whatsappConfigRouter.get('/', async (req, res) => {
-  const { companyId } = req.query as Record<string, string>
-  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  const companyId = await resolveOwnCompany(req, res, (req.query as Record<string, string>).companyId)
+  if (!companyId) return
   try {
     const db = await getDb()
     const doc = await db.collection(COLLECTION).findOne({ companyId })
@@ -110,10 +141,10 @@ whatsappConfigRouter.get('/', async (req, res) => {
   }
 })
 
-whatsappConfigRouter.put('/', async (req, res) => {
+whatsappConfigRouter.put('/', requireRole(['admin', 'supervisor']), async (req, res) => {
   const body = req.body ?? {}
-  const companyId = (body.companyId as string)?.trim()
-  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  const companyId = await resolveOwnCompany(req, res, body.companyId)
+  if (!companyId) return
 
   const db = await getDb()
   const existing = await db.collection(COLLECTION).findOne({ companyId }) as Record<string, unknown> | null
@@ -131,6 +162,9 @@ whatsappConfigRouter.put('/', async (req, res) => {
     }
     setFields[key] = merged[key]
   }
+  // Plantillas propias: si llegan, reemplazan la lista (así se pueden eliminar).
+  if (Array.isArray(body.custom)) merged.custom = sanitizeCustom(body.custom)
+  setFields.custom = merged.custom
 
   try {
     await db.collection(COLLECTION).updateOne(
