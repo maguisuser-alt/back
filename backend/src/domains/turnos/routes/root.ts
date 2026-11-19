@@ -4,44 +4,34 @@ import { hashPassword, signToken } from '../lib/auth.js'
 import { deleteCompany } from '../lib/database.js'
 import { getCompaniesCollection, getUsersCollection, getDb } from '../lib/mongodb.js'
 import { requireAuth, requireRoot } from '../middleware/auth.js'
-import type { AccessModule, CompanySettings, CompanyType } from '../types.js'
+import { invalidateAccess } from '../lib/access-cache.js'
+import { checkStatusChange } from '../lib/user-admin.js'
+import { applyRootFeatures } from '../../trazabilidad/routes/settings.js'
+import { defaultPermissionsByRole, type AccessModule, type CompanySettings, type CompanyType } from '../types.js'
 
 export const rootRouter = Router()
 
-const TRACER_API_URL = (process.env.TRACER_API_URL || '').replace(/\/$/, '')
-
-async function syncTracerFeatures(companyId: string, settings: {
-  sheetsEnabled?: boolean
-  activityLog?: boolean; sendEmail?: boolean; emailTo?: string
-  whatsappTrazabilidad?: boolean
-  whatsappUnified?: boolean; whatsappAudio?: boolean; whatsappCatalog?: boolean
-  whatsappDocument?: boolean; markerEditor?: boolean; registrarActividad?: boolean
-  operationTypesLimit?: number
-}, authHeader?: string) {
-  if (!TRACER_API_URL) {
-    console.warn('[root] TRACER_API_URL no configurado: no se sincronizarán las features de trazabilidad con el backend del tracer.')
-    return
-  }
+/**
+ * Lleva los ajustes de trazabilidad de la empresa al dominio de trazabilidad.
+ * Es el mismo backend, así que se llama directo (antes se hacía PUT a
+ * TRACER_API_URL, que apuntaba al frontend en Vercel y no llegaba nunca).
+ * Devuelve false si falló, para avisar al root.
+ */
+async function syncTracerFeatures(companyId: string, settings: Record<string, unknown>): Promise<boolean> {
   try {
-    // El endpoint del tracer está protegido con `requireToken`. Si no reenviamos
-    // el token del root, responde 401 y los cambios de configuración se guardan
-    // solo en la empresa (BD de turnos) pero NUNCA llegan a trazabilidad, por lo
-    // que la app seguía mostrando la configuración anterior.
-    const res = await fetch(`${TRACER_API_URL}/settings/features`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(authHeader ? { Authorization: authHeader } : {}),
-      },
-      body: JSON.stringify({ companyId, ...settings, source: 'root' }),
-    })
-    if (!res.ok) {
-      console.error(`[root] Sincronización de features fallida (${res.status}): ${await res.text().catch(() => res.statusText)}`)
-    }
+    await applyRootFeatures(companyId, settings)
+    return true
   } catch (err) {
-    console.error('[root] No se pudo sincronizar features con el tracer:', err)
+    console.error('[root] No se pudo sincronizar features con trazabilidad:', err)
+    return false
   }
 }
+
+/** Módulos que el root puede asignar (los desconocidos se descartan). */
+const KNOWN_MODULES = new Set<string>([
+  ...defaultPermissionsByRole.admin.empresa, ...defaultPermissionsByRole.admin.academia,
+  'trazabilidad', 'academia', 'whatsapp-turnos', 'teletrabajo',
+])
 
 // ── Credenciales root ───────────────────────────────────────────────────────
 // Se leen de ROOT_USERNAME / ROOT_PASSWORD (Render → Environment).
@@ -97,6 +87,7 @@ rootRouter.get('/companies', async (_request, response) => {
     companies.map(async (company) => {
       const adminCount = await usersCol.countDocuments({ companyId: company.id, role: 'admin' })
       const employeeCount = await usersCol.countDocuments({ companyId: company.id })
+      const inactiveCount = await usersCol.countDocuments({ companyId: company.id, activa: false } as never)
 
       return {
         id: company.id,
@@ -112,6 +103,7 @@ rootRouter.get('/companies', async (_request, response) => {
         trazabilidadSettings: company.settings?.trazabilidadSettings,
         adminCount,
         employeeCount,
+        inactiveCount,
         createdAt: company.createdAt,
       }
     }),
@@ -174,6 +166,7 @@ rootRouter.patch('/companies/:companyId', async (request, response) => {
     response.status(404).json({ message: 'Empresa no encontrada.' })
     return
   }
+  invalidateAccess({ companyId })
 
   response.json({
     message: typeof activa === 'boolean'
@@ -215,6 +208,7 @@ rootRouter.post('/companies/:companyId/assign-admin', async (request, response) 
     { id: userId },
     { $set: { companyId, role: 'admin' } },
   )
+  invalidateAccess({ userId, companyId })
 
   response.json({ message: `Usuario ${user.nombreCompleto} asignado como admin de ${company.nombre}.` })
 })
@@ -311,10 +305,12 @@ rootRouter.patch('/companies/:companyId/modules', async (request, response) => {
     response.status(400).json({ message: 'enabledModules (array) es requerido.' })
     return
   }
+  // Solo módulos conocidos y sin repetir (evita basura o duplicados en la empresa).
+  const cleanModules = [...new Set(enabledModules.filter((m) => typeof m === 'string' && KNOWN_MODULES.has(m)))] as AccessModule[]
 
   const companiesCol = await getCompaniesCollection()
 
-  const update: Record<string, unknown> = { enabledModules }
+  const update: Record<string, unknown> = { enabledModules: cleanModules }
   if (trazabilidadSettings && typeof trazabilidadSettings === 'object') {
     const opLimitRaw = trazabilidadSettings.operationTypesLimit
     const operationTypesLimit = typeof opLimitRaw === 'number' && opLimitRaw >= 0
@@ -350,11 +346,23 @@ rootRouter.patch('/companies/:companyId/modules', async (request, response) => {
     return
   }
 
+  invalidateAccess({ companyId })
+
+  // Los ajustes de trazabilidad se aplican antes de responder: el root sabe si
+  // llegaron (antes se lanzaban en segundo plano y se perdían sin aviso).
+  let tracerSynced: boolean | undefined
   if (trazabilidadSettings && typeof trazabilidadSettings === 'object') {
-    void syncTracerFeatures(companyId, update['settings.trazabilidadSettings'] as any, request.headers.authorization)
+    tracerSynced = await syncTracerFeatures(companyId, update['settings.trazabilidadSettings'] as Record<string, unknown>)
   }
 
-  response.json({ message: 'Módulos actualizados correctamente.', enabledModules, trazabilidadSettings: update['settings.trazabilidadSettings'] })
+  response.json({
+    message: tracerSynced === false
+      ? 'Módulos guardados, pero no se pudieron aplicar los ajustes de trazabilidad. Intenta de nuevo.'
+      : 'Módulos actualizados correctamente.',
+    enabledModules: cleanModules,
+    trazabilidadSettings: update['settings.trazabilidadSettings'],
+    tracerSynced,
+  })
 })
 
 // ── GET /api/root/companies/:companyId/users ────────────────────────────────
@@ -389,6 +397,33 @@ rootRouter.get('/companies/:companyId/users', async (request, response) => {
   response.json(list)
 })
 
+// ── PATCH /api/root/companies/:companyId/users/:userId/status ───────────────
+// Activa o desactiva un usuario de la empresa. Body: { activa: boolean }
+// El usuario desactivado queda bloqueado en su siguiente petición.
+rootRouter.patch('/companies/:companyId/users/:userId/status', async (request, response) => {
+  const { companyId, userId } = request.params
+  const { activa } = request.body as { activa?: boolean }
+  if (typeof activa !== 'boolean') {
+    response.status(400).json({ message: 'El campo "activa" (true/false) es requerido.' })
+    return
+  }
+  const usersCol = await getUsersCollection()
+  const user = await usersCol.findOne({ id: userId, companyId })
+  if (!user) {
+    response.status(404).json({ message: 'Empleado no encontrado en esta empresa.' })
+    return
+  }
+  const activeAdmins = await usersCol.countDocuments({ companyId, role: 'admin', activa: { $ne: false } } as never)
+  const check = checkStatusChange({ actor: 'root', target: user, activa, activeAdmins })
+  if (!check.ok) {
+    response.status(check.status).json({ message: check.message })
+    return
+  }
+  await usersCol.updateOne({ id: userId }, { $set: { activa } })
+  invalidateAccess({ userId })
+  response.json({ message: `${user.nombreCompleto} ${activa ? 'activado' : 'desactivado'}.`, activa })
+})
+
 // ── DELETE /api/root/companies/:companyId/users/:userId ─────────────────────
 // Elimina un empleado de una empresa (contexto root).
 rootRouter.delete('/companies/:companyId/users/:userId', async (request, response) => {
@@ -402,6 +437,7 @@ rootRouter.delete('/companies/:companyId/users/:userId', async (request, respons
   }
 
   await usersCol.deleteOne({ id: userId })
+  invalidateAccess({ userId })
   response.json({ message: `Empleado ${user.nombreCompleto} eliminado.` })
 })
 
@@ -443,6 +479,7 @@ rootRouter.delete('/companies/:companyId', async (request, response) => {
   }
 
   await deleteCompany(companyId)
+  invalidateAccess({ companyId })
   response.json({ message: `Empresa ${company.nombre} y sus datos asociados fueron eliminados.` })
 })
 

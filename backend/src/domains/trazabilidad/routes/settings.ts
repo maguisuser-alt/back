@@ -521,14 +521,35 @@ settingsRouter.put('/features', async (req, res) => {
   const body = req.body ?? {}
   const companyId = (body.companyId as string)?.trim()
   if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
-
-  // Origen de la petición:
-  //  - 'root': proviene del panel super-admin. Define QUÉ se permite (allowedFeatures)
-  //            además del valor; es la autoridad final.
-  //  - admin de empresa (sin source): solo puede cambiar funciones PERMITIDAS por el root.
-  const isRoot = body.source === 'root'
-
   try {
+    // Por HTTP solo cuenta como root un token root con firma verificada
+    // (sesión sintética 'root-session' de requireToken). El rol de una sesión
+    // normal de trazabilidad lo envía el cliente, así que no basta `source:'root'`.
+    const isRoot = req.session?.sessionId === 'root-session' && req.session.role === 'root'
+    const $set = await applyFeaturesUpdate({ ...body, companyId }, isRoot)
+    res.json({ message: 'Funciones actualizadas.', ...$set })
+  } catch (err) {
+    console.error('[settings] Error al guardar features:', err)
+    res.status(500).json({ message: 'Error al guardar funciones.' })
+  }
+})
+
+/**
+ * Aplica los ajustes de trazabilidad que define el PANEL ROOT (turnos) para una
+ * empresa. Se llama en el mismo proceso del backend unificado, sin HTTP: antes
+ * el root hacía PUT a TRACER_API_URL, que apuntaba al frontend (Vercel) y los
+ * cambios nunca llegaban.
+ */
+export async function applyRootFeatures(companyId: string, settings: Record<string, unknown>): Promise<void> {
+  await applyFeaturesUpdate({ ...settings, companyId }, true)
+}
+
+async function applyFeaturesUpdate(body: Record<string, unknown>, isRoot: boolean): Promise<Record<string, unknown>> {
+  const companyId = String(body.companyId)
+  // Origen:
+  //  - root: define QUÉ se permite (allowedFeatures) además del valor; autoridad final.
+  //  - admin de empresa: solo puede cambiar funciones PERMITIDAS por el root.
+  {
     const db = getDb()
     const existing = await db.collection(COLLECTION).findOne({ companyId }) as Record<string, unknown> | null
     const allowed = readAllowed(existing)
@@ -570,12 +591,9 @@ settingsRouter.put('/features', async (req, res) => {
       { upsert: true },
     )
     resetWhatsAppUnifiedCache()
-    res.json({ message: 'Funciones actualizadas.', ...$set })
-  } catch (err) {
-    console.error('[settings] Error al guardar features:', err)
-    res.status(500).json({ message: 'Error al guardar funciones.' })
+    return $set
   }
-})
+}
 
 /**
  * GET /api/settings/email?companyId=xxx

@@ -1,6 +1,9 @@
 import { Router } from 'express'
 import { createUser, createUserInvitation, readDatabase, updateUser, deleteUser } from '../lib/database.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
+import { resolveAllowedModules } from '../lib/access.js'
+import { invalidateAccess } from '../lib/access-cache.js'
+import { canManageUsers, checkStatusChange, publicUser } from '../lib/user-admin.js'
 
 export const usersRouter = Router()
 
@@ -18,7 +21,44 @@ usersRouter.get('/', adminOrSupervisor, async (request, response) => {
     ''
   const users = db.users.filter((user) => user.companyId === companyId)
 
-  response.json(users)
+  response.json(users.map(publicUser))
+})
+
+/**
+ * PATCH /users/:userId/status — activar / desactivar un usuario de la empresa.
+ * Body: { activa: boolean }
+ * Lo puede hacer el admin y cualquier cargo con opciones de admin sobre los
+ * empleados (editar-empleados / eliminar-empleados). Reglas en user-admin.ts.
+ * El usuario desactivado queda bloqueado en su siguiente petición.
+ */
+usersRouter.patch('/:userId/status', async (request, response) => {
+  const { activa } = request.body ?? {}
+  if (typeof activa !== 'boolean') {
+    response.status(400).json({ message: 'El campo "activa" (true/false) es requerido.' })
+    return
+  }
+  const db = await readDatabase()
+  const actor = db.users.find((u) => u.id === request.authUser!.userId)
+  if (!actor) { response.status(401).json({ message: 'Sesion no valida.' }); return }
+  const companyId = actor.companyId || request.authUser!.companyId
+  if (!canManageUsers(actor, resolveAllowedModules(db, actor))) {
+    response.status(403).json({ message: 'No tienes permisos para activar o desactivar usuarios.' })
+    return
+  }
+  const target = db.users.find((u) => u.id === request.params.userId && u.companyId === companyId)
+  if (!target) { response.status(404).json({ message: 'Usuario no encontrado.' }); return }
+
+  const activeAdmins = db.users.filter((u) => u.companyId === companyId && u.role === 'admin' && u.activa !== false).length
+  const check = checkStatusChange({ actor, target, activa, activeAdmins })
+  if (!check.ok) { response.status(check.status).json({ message: check.message }); return }
+
+  target.activa = activa
+  await updateUser(target)
+  invalidateAccess({ userId: target.id })
+  response.json({
+    message: `${target.nombreCompleto} ${activa ? 'activado' : 'desactivado'}.`,
+    user: publicUser(target),
+  })
 })
 
 usersRouter.get('/invitations', adminOrSupervisor, async (request, response) => {
@@ -178,7 +218,7 @@ usersRouter.get('/:userId', adminOrSupervisor, async (request, response) => {
     return
   }
 
-  response.json(user)
+  response.json(publicUser(user))
 })
 
 /**
@@ -216,6 +256,12 @@ usersRouter.patch('/:userId', adminOnly, async (request, response) => {
   if (numeroDocumento !== undefined) user.numeroDocumento = String(numeroDocumento)
   if (correo !== undefined)         user.correo         = String(correo)
   if (telefono !== undefined)       user.telefono       = telefono ? String(telefono) : undefined
+  if (activa !== undefined && Boolean(activa) !== (user.activa !== false)) {
+    const actor = db.users.find((u) => u.id === request.authUser!.userId)
+    const activeAdmins = db.users.filter((u) => u.companyId === companyId && u.role === 'admin' && u.activa !== false).length
+    const check = checkStatusChange({ actor: actor ?? { id: request.authUser!.userId, role: 'admin' }, target: user, activa: Boolean(activa), activeAdmins })
+    if (!check.ok) { response.status(check.status).json({ message: check.message }); return }
+  }
   if (role !== undefined)           user.role           = role
   if (activa !== undefined)         user.activa         = Boolean(activa)
 
@@ -233,7 +279,8 @@ usersRouter.patch('/:userId', adminOnly, async (request, response) => {
   }
 
   await updateUser(user)
-  response.json(user)
+  invalidateAccess({ userId: user.id })
+  response.json(publicUser(user))
 })
 
 /**
@@ -261,6 +308,7 @@ usersRouter.delete('/:userId', adminOnly, async (request, response) => {
   }
 
   await deleteUser(user.id, companyId)
+  invalidateAccess({ userId: user.id })
   response.status(204).send()
 })
 

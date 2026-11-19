@@ -1,5 +1,8 @@
+import { createHash } from 'node:crypto'
 import { Router } from 'express'
 import { signToken } from '../lib/auth.js'
+import { requireAuth } from '../middleware/auth.js'
+import { getCompaniesCollection, getPositionsCollection, getUsersCollection } from '../lib/mongodb.js'
 import { getDefaultModulesByType, getDefaultSettings, resolveAllowedModules, resolvePermissionLevels } from '../lib/access.js'
 import {
   createCompany,
@@ -9,7 +12,7 @@ import {
   updateAcademicGroup,
   updateUserInvitation,
 } from '../lib/database.js'
-import type { CompanyType } from '../types.js'
+import type { Company, CompanyType, DatabaseSchema, Position, User } from '../types.js'
 
 export const authRouter = Router()
 
@@ -132,8 +135,14 @@ authRouter.post('/login', async (request, response) => {
     const db = await readDatabase()
     const user = db.users.find((candidate) => candidate.numeroDocumento === numeroDocumento)
 
-    if (!user || !user.activa) {
+    if (!user) {
       response.status(401).json({ message: 'Documento no autorizado.' })
+      return
+    }
+    // `activa` ausente (usuarios antiguos) cuenta como activo, igual que en el
+    // resto del sistema; antes `!user.activa` bloqueaba a esos usuarios.
+    if (user.activa === false) {
+      response.status(401).json({ code: 'USER_INACTIVE', message: 'Tu usuario está desactivado. Contacta al administrador de tu empresa.' })
       return
     }
 
@@ -177,6 +186,62 @@ authRouter.post('/login', async (request, response) => {
     }
 
     response.status(500).json({ message: 'Error interno al iniciar sesión.', detail: message })
+  }
+})
+
+/**
+ * GET /api/auth/session
+ * Permisos ACTUALES del usuario (módulos, niveles, rol) y de su empresa
+ * (módulos habilitados, estado). El frontend lo consulta cada pocos segundos y
+ * al volver a la pestaña: así lo que el root o el admin cambian se refleja sin
+ * volver a iniciar sesión. `version` cambia cuando cambia cualquier permiso.
+ * Consultas puntuales (no lee toda la base) para que sea barato.
+ */
+authRouter.get('/session', requireAuth, async (request, response) => {
+  try {
+    const { userId, companyId } = request.authUser!
+    const [usersCol, companiesCol, positionsCol] = await Promise.all([
+      getUsersCollection(), getCompaniesCollection(), getPositionsCollection(),
+    ])
+    const user = await usersCol.findOne({ id: userId } as never, { projection: { _id: 0 } }) as User | null
+    if (!user || user.activa === false) {
+      response.status(401).json({ code: 'USER_INACTIVE', message: 'Tu usuario fue desactivado. Contacta al administrador de tu empresa.' })
+      return
+    }
+    const company = await companiesCol.findOne({ id: user.companyId || companyId } as never, { projection: { _id: 0 } }) as Company | null
+    if (company && company.activa === false) {
+      response.status(403).json({ code: 'COMPANY_INACTIVE', message: 'Tu empresa está inactiva. Contacta al administrador del sistema.' })
+      return
+    }
+    const position = user.positionId
+      ? await positionsCol.findOne({ id: user.positionId } as never, { projection: { _id: 0 } }) as Position | null
+      : null
+    // Mini "base de datos" con lo justo para resolver permisos.
+    const db = { companies: company ? [company] : [], positions: position ? [position] : [], users: [user] } as unknown as DatabaseSchema
+    const allowedModules = resolveAllowedModules(db, user)
+    const permissionLevels = resolvePermissionLevels(db, user)
+    const payload = {
+      user: {
+        id: user.id,
+        companyId: user.companyId,
+        nombreCompleto: user.nombreCompleto,
+        correo: user.correo,
+        cargo: user.cargo,
+        role: user.role,
+        positionId: user.positionId,
+        allowedModules,
+        permissionLevels,
+      },
+      company: company
+        ? { id: company.id, nombre: company.nombre, tipo: company.tipo, activa: company.activa !== false, enabledModules: company.enabledModules ?? [] }
+        : null,
+    }
+    const version = createHash('sha1').update(JSON.stringify(payload)).digest('hex').slice(0, 12)
+    response.setHeader('Cache-Control', 'no-store')
+    response.json({ ...payload, version })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error desconocido'
+    response.status(500).json({ message: 'No se pudo leer la sesión.', detail: message })
   }
 })
 

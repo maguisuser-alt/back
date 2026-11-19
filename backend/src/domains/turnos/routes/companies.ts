@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { resolveAllowedModules, resolveCompanyIdForUser } from '../lib/access.js'
 import { readDatabase } from '../lib/database.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
+import { publicUser } from '../lib/user-admin.js'
 
 export const companiesRouter = Router()
 
@@ -75,7 +76,8 @@ companiesRouter.get('/management', async (request, response) => {
       totalTurnos: turns.length,
     },
     positions,
-    users,
+    // Sin hashes de contraseña ni datos biométricos (antes viajaban completos).
+    users: users.map(publicUser),
     locations,
     invitations,
     turns,

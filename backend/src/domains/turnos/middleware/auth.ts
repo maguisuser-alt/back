@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from 'express'
 import { verifyToken } from '../lib/auth.js'
-import { getCompaniesCollection, getUsersCollection } from '../lib/mongodb.js'
+import { getUsersCollection } from '../lib/mongodb.js'
+import { isCompanyActive, isUserActive } from '../lib/access-cache.js'
 import type { AuthUser, UserRole } from '../types.js'
 
 declare global {
@@ -37,27 +38,21 @@ export function requireAuth(request: Request, response: Response, next: NextFunc
   }
 }
 
-/** Caché corta del estado "activa" por empresa: evita una consulta a Mongo en cada request. */
-const ACTIVE_CACHE_TTL_MS = 20_000
-const activeCache = new Map<string, { activa: boolean; at: number }>()
-
-/** Devuelve false solo si la empresa existe y está marcada como inactiva. Falla abierto. */
-async function isCompanyActive(companyId: string): Promise<boolean> {
-  const hit = activeCache.get(companyId)
-  if (hit && Date.now() - hit.at < ACTIVE_CACHE_TTL_MS) return hit.activa
-  const company = (await (await getCompaniesCollection()).findOne(
-    { id: companyId } as any,
-    { projection: { _id: 0, activa: 1 } },
-  )) as { activa?: boolean } | null
-  const activa = company?.activa !== false
-  activeCache.set(companyId, { activa, at: Date.now() })
-  return activa
-}
-
+/**
+ * Bloquea al instante (aunque el token siga vigente) si la empresa o el
+ * propio usuario fueron desactivados. Responde con un `code` para que el
+ * frontend cierre la sesión con el motivo correcto. Si falla la lectura de la
+ * base de datos se deja pasar (no se corta la operación por un error de red).
+ */
 async function checkCompanyActive(request: Request, response: Response, next: NextFunction) {
+  const { companyId, userId } = request.authUser!
   try {
-    if (!(await isCompanyActive(request.authUser!.companyId))) {
-      response.status(403).json({ message: 'Tu empresa está inactiva. Contacta al administrador del sistema.' })
+    if (!(await isCompanyActive(companyId))) {
+      response.status(403).json({ code: 'COMPANY_INACTIVE', message: 'Tu empresa está inactiva. Contacta al administrador del sistema.' })
+      return
+    }
+    if (!(await isUserActive(userId, companyId))) {
+      response.status(401).json({ code: 'USER_INACTIVE', message: 'Tu usuario fue desactivado. Contacta al administrador de tu empresa.' })
       return
     }
   } catch {
@@ -78,7 +73,7 @@ export async function requireActiveCompany(request: Request, response: Response,
 
   try {
     if (!(await isCompanyActive(request.authUser.companyId))) {
-      response.status(403).json({ message: 'Tu empresa está inactiva. Contacta al administrador del sistema.' })
+      response.status(403).json({ code: 'COMPANY_INACTIVE', message: 'Tu empresa está inactiva. Contacta al administrador del sistema.' })
       return
     }
   } catch {
