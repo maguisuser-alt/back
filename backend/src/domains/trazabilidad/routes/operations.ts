@@ -8,6 +8,7 @@ import { getStepsForType, LINEA_BLANCA_STEPS, OPTIONAL_STEPS, normalizeClientTim
 import { existingClientKeys, isDuplicateKey } from '../lib/photo-dedupe.js'
 import { referencedPhotoIdsExcept, isPhotoShared, isPrefixReferenced } from '../lib/photo-refs.js'
 import { readAllowed } from '../lib/features.js'
+import { buildActivityFeed, type HistDoc, type LogDoc, type OpDoc } from '../lib/activity-feed.js'
 import { toLocationRef, recordMovement } from '../lib/locations.js'
 
 /**
@@ -797,6 +798,90 @@ operationsRouter.get('/products/:productCode/movements', async (req, res) => {
   } catch (err) {
     console.error('[operations] Error al leer movimientos:', err)
     res.status(500).json({ message: 'Error al leer el recorrido del producto.' })
+  }
+})
+
+// ── Actividad reciente ──────────────────────────────────────────────────
+// IMPORTANTE: van ANTES de GET '/:trackingCode'. Antes estaban al final del
+// archivo y '/:trackingCode' las capturaba ("activity" se tomaba como código de
+// registro → 404 "Operación no encontrada"), por eso la Actividad reciente del
+// inicio siempre salía vacía.
+
+/**
+ * GET /api/operations/activity?companyId=xxx&limit=50
+ * Log de actividad anotado a mano (compatibilidad con clientes anteriores).
+ */
+operationsRouter.get('/activity', async (req, res) => {
+  const { companyId, limit } = req.query as Record<string, string>
+  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  try {
+    const lim = Math.min(Number(limit) || 50, 200)
+    const entries = await getDb()
+      .collection('activity_log')
+      .find({ companyId })
+      .sort({ createdAt: -1 })
+      .limit(lim)
+      .toArray()
+    res.json({ entries })
+  } catch (err) {
+    console.error('[activity] Error al leer:', err)
+    res.status(500).json({ message: 'Error al leer el log de actividad.' })
+  }
+})
+
+/**
+ * GET /api/operations/activity/feed?companyId=xxx&limit=20
+ * Últimas actividades de la empresa: registros (creados, actualizados,
+ * completados), marcas en la DATA (producto, piezas, tabla, recepción, quién)
+ * y actividades anotadas a mano, de lo más nuevo a lo más viejo.
+ */
+operationsRouter.get('/activity/feed', async (req, res) => {
+  const { companyId, limit } = req.query as Record<string, string>
+  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  const lim = Math.min(Math.max(Number(limit) || 20, 1), 100)
+  try {
+    const db = getDb()
+    const [ops, history, logs] = await Promise.all([
+      getOperationsCollection().aggregate([
+        { $match: { companyId } },
+        { $sort: { updatedAt: -1 } },
+        { $limit: lim },
+        {
+          $project: {
+            _id: 0, trackingCode: 1, operationType: 1, operatorName: 1, vehiclePlate: 1, locationName: 1,
+            status: 1, createdAt: 1, updatedAt: 1, completedAt: 1,
+            productos: { $size: { $ifNull: ['$lineaBlanca', []] } },
+            fotos: { $size: { $ifNull: ['$photos', []] } },
+            lastProduct: { $arrayElemAt: [{ $ifNull: ['$lineaBlanca.productCode', []] }, -1] },
+          },
+        },
+      ]).toArray(),
+      db.collection('received_history').find({ companyId }, { projection: { _id: 0 } }).sort({ at: -1 }).limit(lim).toArray(),
+      db.collection('activity_log').find({ companyId }).sort({ createdAt: -1 }).limit(lim).toArray(),
+    ])
+    // Nombres de las tablas DATA y de las recepciones usadas.
+    const sheetIds = [...new Set(history.map((h) => h.sheetId).filter((v): v is string => typeof v === 'string' && !!v))]
+    const scopeIds = [...new Set(history.map((h) => h.scope).filter((v): v is string => typeof v === 'string' && !!v))]
+    const [sheetDocs, scopeDocs] = await Promise.all([
+      sheetIds.length
+        ? db.collection('company_sheets').find({ companyId, id: { $in: sheetIds } }, { projection: { _id: 0, id: 1, sheetName: 1 } }).toArray()
+        : Promise.resolve([]),
+      scopeIds.length
+        ? db.collection('received_scopes').find({ companyId, id: { $in: scopeIds } }, { projection: { _id: 0, id: 1, name: 1 } }).toArray()
+        : Promise.resolve([]),
+    ])
+    const items = buildActivityFeed({
+      ops: ops as OpDoc[],
+      history: history as HistDoc[],
+      logs: logs as LogDoc[],
+      sheets: new Map(sheetDocs.map((s) => [String(s.id), String(s.sheetName ?? '')])),
+      scopes: new Map(scopeDocs.map((s) => [String(s.id), String(s.name ?? '')])),
+      limit: lim,
+    })
+    res.json({ items })
+  } catch (err) {
+    console.error('[activity] Error al armar la actividad reciente:', err)
+    res.status(500).json({ message: 'Error al leer la actividad reciente.' })
   }
 })
 
@@ -1991,28 +2076,6 @@ operationsRouter.post('/:trackingCode/send-email', async (req, res) => {
   } catch (err) {
     console.error('[operations] Error al enviar correo:', err)
     res.status(500).json({ message: err instanceof Error ? err.message : 'No se pudo enviar el correo.' })
-  }
-})
-
-/**
- * GET /api/activity?companyId=xxx&limit=50
- * Devuelve el log de actividad de la empresa (más recientes primero).
- */
-operationsRouter.get('/activity', async (req, res) => {
-  const { companyId, limit } = req.query as Record<string, string>
-  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
-  try {
-    const lim = Math.min(Number(limit) || 50, 200)
-    const entries = await getDb()
-      .collection('activity_log')
-      .find({ companyId })
-      .sort({ createdAt: -1 })
-      .limit(lim)
-      .toArray()
-    res.json({ entries })
-  } catch (err) {
-    console.error('[activity] Error al leer:', err)
-    res.status(500).json({ message: 'Error al leer el log de actividad.' })
   }
 })
 
