@@ -21,6 +21,7 @@ import {
 import { isGitHubConfigured } from '../lib/github-storage.js'
 import { createChatQueue } from '../lib/chat-queue.js'
 import { shouldForwardToTurnos } from '../lib/turnos-link.js'
+import { routeLine, totalsLine, type SummaryOp } from '../lib/operation-summary.js'
 
 export const whatsappWebRouter = Router()
 
@@ -409,7 +410,7 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
   const userId = reqUserId(req)
   if (!trackingCode) { res.status(400).json({ message: 'trackingCode es requerido.' }); return }
   // Campos de cabecera a incluir en el mensaje de encabezado. Si no se envía,
-  // se incluyen todos (compatibilidad). Valores: 'tipo','placa','operador','fecha'.
+  // se incluyen todos (compatibilidad). Valores: 'tipo','placa','operador','ruta','fecha','totales'.
   const hf: string[] | null = Array.isArray(headerFields) ? headerFields.map(String) : null
   const includeField = (f: string) => !hf || hf.includes(f)
   // Si headerOnly=true, envía SOLO el encabezado (para la matriz mensaje×chat).
@@ -486,9 +487,15 @@ whatsappWebRouter.post('/send-operation', async (req, res) => {
     ].filter(Boolean).join(' · ')
     if (tipoLinea) headerLines.push(tipoLinea)
     if (includeField('operador')) headerLines.push(`👤 ${op.operatorName}`)
+    // Punto de origen y punto final (o el lugar, si no hay origen).
+    if (includeField('ruta')) {
+      const ruta = routeLine(op as SummaryOp)
+      if (ruta) headerLines.push(ruta)
+    }
     if (includeField('fecha')) {
       headerLines.push(fin ? `🕒 Inicio: ${inicio}\n✅ Finalizado: ${fin}` : `🕒 ${inicio}`)
     }
+    if (includeField('totales')) headerLines.push(totalsLine(op as SummaryOp))
     // Fallback: si se deseleccionaron todos los campos, incluye al menos el
     // operador para que el encabezado no quede solo con el código.
     if (headerLines.length === 1) headerLines.push(`👤 ${op.operatorName}`)

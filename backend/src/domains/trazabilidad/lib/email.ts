@@ -1,4 +1,7 @@
 import nodemailer from 'nodemailer'
+import { routeItems, totals, type SummaryLocation } from './operation-summary.js'
+
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
 /**
  * Configura el transporte SMTP a partir de variables de entorno.
@@ -27,6 +30,11 @@ export type OperationEmailData = {
   operatorName: string
   createdAt?: string
   completedAt?: string
+  /** Punto de origen y punto final (o lugar) del registro. */
+  locationName?: string
+  isTransfer?: boolean
+  origin?: SummaryLocation | null
+  destination?: SummaryLocation | null
   photos: Array<{ driveUrl?: string; comment?: string; stepName?: string; mediaType?: 'image' | 'audio' | 'document'; fileName?: string; mimeType?: string }>
   products: Array<{
     productCode: string
@@ -83,7 +91,9 @@ function buildOperationHtml(op: OperationEmailData): string {
       <h2 style="border-bottom:2px solid #4f46e5;padding-bottom:8px">📋 Registro ${op.trackingCode}</h2>
       <p style="margin:4px 0"><strong>Tipo:</strong> ${op.operationType}${op.vehiclePlate ? ` · ${op.vehiclePlate}` : ''}</p>
       <p style="margin:4px 0"><strong>Operador:</strong> ${op.operatorName}</p>
+      ${routeItems({ ...op, lineaBlanca: op.products }).map((i) => `<p style="margin:4px 0"><strong>${i.label}:</strong> ${esc(i.value)}</p>`).join('')}
       <p style="margin:4px 0"><strong>Inicio:</strong> ${inicio}${fin ? ` &nbsp; <strong>Finalizado:</strong> ${fin}` : ''}</p>
+      <p style="margin:4px 0"><strong>Fotos:</strong> ${totals({ ...op, lineaBlanca: op.products }).photos} &nbsp; <strong>Productos:</strong> ${(op.products ?? []).length}</p>
       ${photoCards ? `<hr/><h3>Fotos generales</h3>${photoCards}` : ''}
       ${productCards ? `<hr/><h3>Productos</h3>${productCards}` : ''}
       ${filesBlock}
@@ -151,7 +161,8 @@ async function sendWithResend(to: string, subject: string, html: string, text: s
 export async function sendOperationEmail(to: string, op: OperationEmailData): Promise<boolean> {
   const subject = `Registro ${op.trackingCode} — ${op.operationType}${op.vehiclePlate ? ` · ${op.vehiclePlate}` : ''}`
   const html = buildOperationHtml(op)
-  const text = `Registro ${op.trackingCode}\nTipo: ${op.operationType}\nOperador: ${op.operatorName}`
+  const route = routeItems({ ...op, lineaBlanca: op.products }).map((i) => `${i.label}: ${i.value}`).join('\n')
+  const text = `Registro ${op.trackingCode}\nTipo: ${op.operationType}\nOperador: ${op.operatorName}${route ? `\n${route}` : ''}`
 
   // Audios y documentos se envían como ARCHIVOS adjuntos.
   const attachments = await collectAttachments(op)

@@ -1459,6 +1459,10 @@ operationsRouter.patch('/:trackingCode/complete', async (req, res) => {
           operatorName: operation.operatorName,
           createdAt: operation.createdAt,
           completedAt,
+          locationName: operation.locationName as string | undefined,
+          isTransfer: operation.isTransfer as boolean | undefined,
+          origin: (operation.origin as LocationRef | undefined) ?? null,
+          destination: (operation.destination as LocationRef | undefined) ?? null,
           photos: operation.photos as Array<{ driveUrl?: string; comment?: string; stepName?: string }>,
           products: (operation.lineaBlanca ?? []) as Array<{
             productCode: string
@@ -2078,6 +2082,10 @@ operationsRouter.post('/:trackingCode/send-email', async (req, res) => {
       operatorName: op.operatorName,
       createdAt: op.createdAt,
       completedAt: op.completedAt,
+      locationName: op.locationName as string | undefined,
+      isTransfer: op.isTransfer as boolean | undefined,
+      origin: (op.origin as LocationRef | undefined) ?? null,
+      destination: (op.destination as LocationRef | undefined) ?? null,
       photos: (op.photos ?? []) as Array<{ driveUrl?: string; comment?: string; stepName?: string; mediaType?: 'image' | 'audio' | 'document'; fileName?: string; mimeType?: string }>,
       products: (op.lineaBlanca ?? []) as Array<{
         productCode: string
