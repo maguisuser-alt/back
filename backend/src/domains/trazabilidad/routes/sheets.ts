@@ -16,6 +16,7 @@ import { nanoid } from 'nanoid'
 import { getDb } from '../lib/mongodb.js'
 import { parseDocument } from '../lib/document-parser.js'
 import { callGas } from '../lib/gas.js'
+import { appendRows } from '../lib/append-rows.js'
 
 export const sheetsRouter = Router()
 
@@ -480,58 +481,135 @@ sheetsRouter.put('/:id/rows', async (req, res) => {
     const doc = await col.findOne({ id, companyId: companyId.trim() })
     if (!doc) { res.status(404).json({ message: 'Hoja no encontrada.' }); return }
 
-    // Normalizar: todas las celdas a string
-    const cleanRows: string[][] = (rows as unknown[][]).map((r) =>
-      (Array.isArray(r) ? r : []).map((c) => (c === null || c === undefined ? '' : String(c))),
-    )
-    const stored = cleanRows.slice(0, MAX_STORED_ROWS)
     const finalHeaders = Array.isArray(headers) && headers.length > 0
       ? (headers as string[]).map((h) => String(h))
       : (doc.columns as string[]) ?? []
-
-    // 1. Guardar en Mongo
-    await col.updateOne(
-      { id, companyId: companyId.trim() },
-      {
-        $set: {
-          rows: stored,
-          rowCount: cleanRows.length,
-          rowsTruncated: cleanRows.length > MAX_STORED_ROWS,
-          columns: finalHeaders,
-          updatedAt: new Date().toISOString(),
-        },
-      },
-    )
-
-    // 2. Actualizar la Google Sheet (best-effort — no bloquea el guardado)
-    let sheetUpdated = false
-    const GAS_URL = process.env.GAS_WEBHOOK_URL ?? ''
-    if (GAS_URL && doc.sheetId) {
-      try {
-        const data = await callGas(GAS_URL, { action: 'updateSheet', sheetId: doc.sheetId, headers: finalHeaders, rows: stored })
-        sheetUpdated = data.status === 'success'
-      } catch (e) {
-        console.warn('[sheets] No se pudo actualizar la Google Sheet:', e)
-      }
-    }
-
-    const hasSheet = Boolean(doc.sheetId)
-    // Si la copia a Google Sheets falló, se deja marcado para avisar y reintentar.
-    const syncPending = hasSheet && !sheetUpdated
-    await col.updateOne({ id, companyId: companyId.trim() }, { $set: { syncPending } })
-    res.json({
-      message: !hasSheet
-        ? 'Cambios guardados en la app.'
-        : sheetUpdated
-          ? 'Cambios guardados y sincronizados con Google Sheets.'
-          : 'Cambios guardados en la app. No se pudo sincronizar con Google Sheets.',
-      rowCount: cleanRows.length,
-      sheetUpdated,
-      syncPending,
-    })
+    res.json(await persistSheetRows(doc, companyId.trim(), cleanCells(rows as unknown[][]), finalHeaders))
   } catch (err) {
     console.error('[sheets] Error al guardar filas:', err)
     res.status(500).json({ message: 'Error al guardar los cambios.' })
+  }
+})
+
+/** Todas las celdas a texto. */
+function cleanCells(rows: unknown[][]): string[][] {
+  return rows.map((r) => (Array.isArray(r) ? r : []).map((c) => (c === null || c === undefined ? '' : String(c))))
+}
+
+/**
+ * Guarda filas y encabezados de una tabla en Mongo y, si tiene Google Sheet,
+ * intenta copiarlos allá (sin bloquear el guardado si falla).
+ */
+async function persistSheetRows(doc: Record<string, unknown>, companyId: string, cleanRows: string[][], finalHeaders: string[]) {
+  const col = getDb().collection(COLLECTION)
+  const id = String(doc.id)
+  const stored = cleanRows.slice(0, MAX_STORED_ROWS)
+
+  // 1. Guardar en Mongo
+  await col.updateOne(
+    { id, companyId },
+    {
+      $set: {
+        rows: stored,
+        rowCount: cleanRows.length,
+        rowsTruncated: cleanRows.length > MAX_STORED_ROWS,
+        columns: finalHeaders,
+        updatedAt: new Date().toISOString(),
+      },
+    },
+  )
+
+  // 2. Actualizar la Google Sheet (best-effort — no bloquea el guardado)
+  let sheetUpdated = false
+  const GAS_URL = process.env.GAS_WEBHOOK_URL ?? ''
+  if (GAS_URL && doc.sheetId) {
+    try {
+      const data = await callGas(GAS_URL, { action: 'updateSheet', sheetId: doc.sheetId, headers: finalHeaders, rows: stored })
+      sheetUpdated = data.status === 'success'
+    } catch (e) {
+      console.warn('[sheets] No se pudo actualizar la Google Sheet:', e)
+    }
+  }
+
+  const hasSheet = Boolean(doc.sheetId)
+  // Si la copia a Google Sheets falló, se deja marcado para avisar y reintentar.
+  const syncPending = hasSheet && !sheetUpdated
+  await col.updateOne({ id, companyId }, { $set: { syncPending } })
+  return {
+    message: !hasSheet
+      ? 'Cambios guardados en la app.'
+      : sheetUpdated
+        ? 'Cambios guardados y sincronizados con Google Sheets.'
+        : 'Cambios guardados en la app. No se pudo sincronizar con Google Sheets.',
+    rowCount: cleanRows.length,
+    sheetUpdated,
+    syncPending,
+  }
+}
+
+/**
+ * POST /api/sheets/:id/append
+ * Body: { companyId, headers, rows, codeColumn?, skipDuplicates?, addNewColumns? }
+ * Agrega las filas de un documento (ya leído con /preview) al FINAL de una
+ * tabla existente. Las columnas se emparejan por nombre (ver lib/append-rows).
+ */
+sheetsRouter.post('/:id/append', async (req, res) => {
+  const { id } = req.params
+  const { companyId, headers, rows, codeColumn, skipDuplicates, addNewColumns } = req.body ?? {}
+  const cid = typeof companyId === 'string' ? companyId.trim() : ''
+  if (!cid) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  if (!Array.isArray(headers) || !Array.isArray(rows)) {
+    res.status(400).json({ message: 'headers y rows deben ser arreglos.' }); return
+  }
+  if (rows.length === 0) { res.status(400).json({ message: 'El documento no tiene filas para agregar.' }); return }
+
+  try {
+    const doc = await getDb().collection(COLLECTION).findOne({ id, companyId: cid }) as Record<string, unknown> | null
+    if (!doc) { res.status(404).json({ message: 'Tabla no encontrada.' }); return }
+    // Si la copia de la app está recortada, reescribirla perdería las filas que faltan.
+    if (doc.rowsTruncated === true) {
+      res.status(409).json({ message: `La tabla supera ${MAX_STORED_ROWS} filas y la app solo guarda una parte: no se pueden agregar filas sin perder datos. Impórtala como tabla nueva.` })
+      return
+    }
+    const current = cleanCells((doc.rows as unknown[][]) ?? [])
+    const merged = appendRows(
+      ((doc.columns as string[]) ?? []).map(String),
+      current,
+      (headers as unknown[]).map((h) => String(h ?? '')),
+      cleanCells(rows as unknown[][]),
+      {
+        codeColumn: typeof codeColumn === 'number' ? codeColumn : -1,
+        skipDuplicates: skipDuplicates === true,
+        addNewColumns: addNewColumns !== false,
+      },
+    )
+    if (merged.rows.length > MAX_STORED_ROWS) {
+      res.status(409).json({ message: `Al agregar quedarían ${merged.rows.length} filas; el máximo es ${MAX_STORED_ROWS}. Impórtalo como tabla nueva.` })
+      return
+    }
+    if (merged.added === 0) {
+      res.status(409).json({
+        message: merged.skippedDuplicates > 0
+          ? `No se agregó nada: los ${merged.skippedDuplicates} código(s) del documento ya están en la tabla.`
+          : 'No se agregó nada: el documento no tiene filas con datos.',
+        ...merged, rows: undefined,
+      })
+      return
+    }
+    const saved = await persistSheetRows(doc, cid, merged.rows, merged.headers)
+    res.json({
+      ...saved,
+      message: `Se agregaron ${merged.added} fila(s).${saved.syncPending ? ' No se pudo sincronizar con Google Sheets.' : ''}`,
+      added: merged.added,
+      skippedDuplicates: merged.skippedDuplicates,
+      skippedEmpty: merged.skippedEmpty,
+      newColumns: merged.newColumns,
+      ignoredColumns: merged.ignoredColumns,
+      headers: merged.headers,
+    })
+  } catch (err) {
+    console.error('[sheets] Error al agregar filas:', err)
+    res.status(500).json({ message: 'Error al agregar las filas a la tabla.' })
   }
 })
 
