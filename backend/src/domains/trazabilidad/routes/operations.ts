@@ -10,6 +10,7 @@ import { referencedPhotoIdsExcept, isPhotoShared, isPrefixReferenced } from '../
 import { readAllowed } from '../lib/features.js'
 import { buildActivityFeed, type HistDoc, type LogDoc, type OpDoc } from '../lib/activity-feed.js'
 import { toLocationRef, recordMovement } from '../lib/locations.js'
+import { mainDescription, resolveProductCode } from '../lib/product-variant.js'
 
 /**
  * Lee los lugares configurados y si la función de lugares está habilitada para
@@ -922,7 +923,9 @@ operationsRouter.get('/:trackingCode', async (req, res) => {
  */
 operationsRouter.post('/:trackingCode/linea-blanca', async (req, res) => {
   const { trackingCode } = req.params
-  const { productCode, labelData, isLineaBlanca } = req.body ?? {}
+  // allowSameCode: el producto viene de la DATA y puede compartir código (orden)
+  // con otro del registro; se distingue por su descripción.
+  const { productCode, labelData, isLineaBlanca, allowSameCode } = req.body ?? {}
 
   if (!productCode?.trim()) {
     res.status(400).json({ message: 'productCode es requerido.' })
@@ -943,14 +946,22 @@ operationsRouter.post('/:trackingCode/linea-blanca', async (req, res) => {
       return
     }
 
-    const code = productCode.trim()
-
-    // Verifica que no exista ya un producto con ese código en ESTA operación
+    // Verifica que no exista ya un producto con ese código en ESTA operación.
+    // Si viene de la DATA (allowSameCode) con otra descripción, se agrega como
+    // "CÓDIGO · DESCRIPCIÓN" para distinguir productos de la misma orden.
     const existing = (operation.lineaBlanca as LineaBlancaProduct[]) ?? []
-    if (existing.some((p) => p.productCode.toLowerCase() === code.toLowerCase())) {
-      res.status(409).json({ message: `El producto "${code}" ya está registrado en esta operación.` })
+    const resolved = resolveProductCode(
+      existing,
+      String(productCode),
+      (labelData as { descripcion?: string } | undefined)?.descripcion,
+      allowSameCode === true,
+    )
+    if (!resolved.ok) {
+      res.status(409).json({ message: resolved.message })
       return
     }
+    const code = resolved.productCode
+    const orderCode = resolved.orderCode
 
     const companyId = operation.companyId as string | undefined
     const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -959,7 +970,15 @@ operationsRouter.post('/:trackingCode/linea-blanca', async (req, res) => {
       'lineaBlanca.productCode': { $regex: `^${escaped}$`, $options: 'i' },
     }
     if (companyId) dupFilter.companyId = companyId
-    const duplicate = await col.findOne(dupFilter)
+    let duplicate = await col.findOne(dupFilter)
+    // Producto de la DATA con código compartido (misma orden): solo se vincula
+    // si en la otra operación es el MISMO producto (misma descripción).
+    if (duplicate && allowSameCode === true) {
+      const desc = mainDescription((labelData as { descripcion?: string } | undefined)?.descripcion)
+      const src = ((duplicate.lineaBlanca as LineaBlancaProduct[]) ?? []).find((p) => p.productCode.toLowerCase() === code.toLowerCase())
+      const srcDesc = mainDescription(src?.labelData?.descripcion)
+      if (desc && srcDesc && desc.toLowerCase() !== srcDesc.toLowerCase()) duplicate = null
+    }
 
     // Si el producto ya existe en OTRA operación, lo VINCULAMOS en vez de rechazar
     if (duplicate) {
@@ -978,6 +997,7 @@ operationsRouter.post('/:trackingCode/linea-blanca', async (req, res) => {
 
       const linkedProduct: LineaBlancaProduct = {
         productCode: sourceProduct.productCode,
+        ...(orderCode || sourceProduct.orderCode ? { orderCode: orderCode ?? sourceProduct.orderCode } : {}),
         labelData: labelData ? { ...(sourceProduct.labelData ?? {}), ...labelData } : sourceProduct.labelData,
         isLineaBlanca: Boolean(isLineaBlanca) || sourceProduct.isLineaBlanca,
         linkedTo: [sourceTrackingCode],
@@ -1023,7 +1043,8 @@ operationsRouter.post('/:trackingCode/linea-blanca', async (req, res) => {
     }
 
     const newProduct: LineaBlancaProduct = {
-      productCode: productCode.trim(),
+      productCode: code,
+      ...(orderCode ? { orderCode } : {}),
       ...(labelData ? { labelData } : {}),
       isLineaBlanca: Boolean(isLineaBlanca),
       photos: [],
@@ -1053,7 +1074,7 @@ operationsRouter.post('/:trackingCode/linea-blanca', async (req, res) => {
     }
 
     res.status(201).json({
-      message: `Producto ${productCode.trim()} agregado.`,
+      message: `Producto ${code} agregado.`,
       product: newProduct,
       steps: [...LINEA_BLANCA_STEPS],
     })
