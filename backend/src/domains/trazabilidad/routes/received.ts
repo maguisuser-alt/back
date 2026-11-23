@@ -27,6 +27,33 @@ const COLLECTION = 'received_products'
 const HISTORY = 'received_history'
 const SCOPES = 'received_scopes'
 const NOT_FOUND = 'scan_not_found'
+/** Sesiones de conteo por tabla: con el conteo CERRADO no se puede marcar en esa tabla. */
+const COUNT_SESSIONS = 'count_sessions'
+
+interface CountSessionDoc {
+  companyId: string
+  sheetId: string
+  status: 'open' | 'closed'
+  openedBy?: string
+  openedAt?: string
+  closedBy?: string
+  closedAt?: string
+}
+
+/** Sin sesión guardada la tabla está abierta (comportamiento anterior). */
+async function isCountClosed(companyId: string, sheetId: string | undefined): Promise<boolean> {
+  if (!sheetId) return false
+  const s = await getDb().collection(COUNT_SESSIONS).findOne({ companyId, sheetId }, { projection: { status: 1 } })
+  return s?.status === 'closed'
+}
+
+const CLOSED_MSG = 'El conteo de esta tabla está cerrado. Ábrelo en Base de datos para seguir marcando.'
+
+/** Tabla de una marca a partir de su rowKey ('S1' o 'S1:2'). */
+function sheetOfRowKey(rowKey: string | undefined): string {
+  const rk = String(rowKey ?? '')
+  return rk ? rk.split(':')[0] : ''
+}
 
 /**
  * Prepara índices una sola vez:
@@ -243,6 +270,9 @@ receivedRouter.post('/', async (req, res) => {
     if (scope && await isScopeClosed(companyId, scope)) {
       res.status(409).json({ message: 'Esta recepción está cerrada. Reábrela para seguir marcando.' }); return
     }
+    if (await isCountClosed(companyId, sheetId || sheetOfRowKey(rowKey))) {
+      res.status(409).json({ message: CLOSED_MSG, code: 'COUNT_CLOSED' }); return
+    }
     const user = req.session?.user ?? 'desconocido'
     const { before, after, doc } = await applyChange({ companyId, scope, productCode, rowKey, delta, setQty, user, trackingCode, sheetId })
     const historyId = before === after
@@ -281,6 +311,54 @@ receivedRouter.post('/', async (req, res) => {
  * GET /api/received/history?companyId=xxx&scope=yyy[&productCode=zzz][&limit=20]
  * Últimos cambios (quién marcó cuánto y cuándo), del más reciente al más antiguo.
  */
+/**
+ * GET /api/received/count-sessions?companyId=xxx
+ * Estado del conteo de cada tabla (las que nunca se cerraron no aparecen: abiertas).
+ */
+receivedRouter.get('/count-sessions', async (req, res) => {
+  const companyId = (req.query.companyId as string) || req.session?.companyId
+  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  try {
+    const sessions = await getDb().collection<CountSessionDoc>(COUNT_SESSIONS)
+      .find({ companyId }, { projection: { _id: 0, companyId: 0 } })
+      .toArray()
+    res.json({ sessions })
+  } catch (err) {
+    console.error('[received] Error al leer conteos:', err)
+    res.status(500).json({ message: 'No se pudo leer el estado de los conteos.' })
+  }
+})
+
+/**
+ * POST /api/received/count-sessions
+ * Body: { companyId?, sheetId, action: 'open' | 'close' }
+ * Abre o cierra el conteo de una tabla. Con el conteo cerrado nadie puede
+ * marcar ni deshacer en esa tabla; queda quién y cuándo lo cerró.
+ */
+receivedRouter.post('/count-sessions', async (req, res) => {
+  const companyId = (req.body?.companyId as string) || req.session?.companyId
+  const sheetId = String(req.body?.sheetId ?? '').trim().slice(0, 120)
+  const action = req.body?.action
+  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  if (!sheetId) { res.status(400).json({ message: 'sheetId es requerido.' }); return }
+  if (action !== 'open' && action !== 'close') { res.status(400).json({ message: 'action debe ser "open" o "close".' }); return }
+  try {
+    const col = getDb().collection<CountSessionDoc>(COUNT_SESSIONS)
+    await col.createIndex({ companyId: 1, sheetId: 1 }, { unique: true, name: 'count_session_unique' }).catch(() => undefined)
+    const user = req.session?.user ?? 'desconocido'
+    const now = new Date().toISOString()
+    const set: Partial<CountSessionDoc> = action === 'close'
+      ? { status: 'closed', closedBy: user, closedAt: now }
+      : { status: 'open', openedBy: user, openedAt: now }
+    await col.updateOne({ companyId, sheetId }, { $set: set }, { upsert: true })
+    const session = await col.findOne({ companyId, sheetId }, { projection: { _id: 0, companyId: 0 } })
+    res.json({ session })
+  } catch (err) {
+    console.error('[received] Error al cambiar el conteo:', err)
+    res.status(500).json({ message: 'No se pudo cambiar el estado del conteo.' })
+  }
+})
+
 /**
  * POST /api/received/migrate-sheet-scope
  * Body: { companyId?, defaultSheetId? }
@@ -388,6 +466,10 @@ receivedRouter.post('/undo', async (req, res) => {
     if (entry.scope && await isScopeClosed(companyId, entry.scope)) {
       await history.updateOne({ id: historyId }, { $set: { undone: false } })
       res.status(409).json({ message: 'Esta recepción está cerrada. Reábrela para deshacer.' }); return
+    }
+    if (await isCountClosed(companyId, entry.sheetId || sheetOfRowKey(entry.rowKey))) {
+      await history.updateOne({ id: historyId }, { $set: { undone: false } })
+      res.status(409).json({ message: CLOSED_MSG, code: 'COUNT_CLOSED' }); return
     }
 
     const user = req.session?.user ?? 'desconocido'
