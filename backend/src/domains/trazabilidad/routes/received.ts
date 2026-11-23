@@ -19,6 +19,7 @@
 import { randomUUID } from 'node:crypto'
 import { Router } from 'express'
 import { getDb } from '../lib/mongodb.js'
+import { legacyTargetSheet, sheetScopedRowKey } from '../lib/sheet-marks.js'
 
 export const receivedRouter = Router()
 
@@ -222,7 +223,10 @@ receivedRouter.post('/', async (req, res) => {
   const productCode = String(req.body?.productCode ?? '').trim()
   const trackingCode = (req.body?.trackingCode as string) || undefined
   const sheetId = (req.body?.sheetId as string) || undefined
-  const rowKey = rowKeyOf(req.body?.rowKey)
+  // Cada tabla lleva su propio conteo: sin fila concreta, la marca es del
+  // código DENTRO de esa tabla (rowKey = sheetId). Así marcar en una tabla no
+  // marca el mismo código en otra.
+  const rowKey = sheetScopedRowKey(rowKeyOf(req.body?.rowKey), sheetId)
   if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
   if (!productCode) { res.status(400).json({ message: 'productCode es requerido.' }); return }
 
@@ -277,6 +281,64 @@ receivedRouter.post('/', async (req, res) => {
  * GET /api/received/history?companyId=xxx&scope=yyy[&productCode=zzz][&limit=20]
  * Últimos cambios (quién marcó cuánto y cuándo), del más reciente al más antiguo.
  */
+/**
+ * POST /api/received/migrate-sheet-scope
+ * Body: { companyId?, defaultSheetId? }
+ * Pasa las marcas ANTIGUAS "del código" (rowKey '') a su tabla, para que cada
+ * tabla tenga su conteo propio. Por cada marca: tabla guardada en la marca →
+ * tabla del último cambio del historial → `defaultSheetId` (DATA principal).
+ * Es idempotente y seguro con varios equipos a la vez: cada marca antigua se
+ * BORRA de forma atómica antes de sumarla en su tabla, así no se suma dos veces.
+ */
+receivedRouter.post('/migrate-sheet-scope', async (req, res) => {
+  const companyId = (req.body?.companyId as string) || req.session?.companyId
+  const defaultSheetId = typeof req.body?.defaultSheetId === 'string' ? req.body.defaultSheetId : ''
+  if (!companyId) { res.status(400).json({ message: 'companyId es requerido.' }); return }
+  try {
+    await ensureIndex()
+    const db = getDb()
+    const col = db.collection(COLLECTION)
+    const legacy = await col.find({ companyId, rowKey: { $in: ['', null] } }).toArray()
+    let moved = 0
+    let skipped = 0
+    for (const doc of legacy) {
+      const scope = scopeOf(doc.scope)
+      const codeLower = String(doc.productCodeLower ?? String(doc.productCode ?? '').toLowerCase())
+      let histSheet = ''
+      if (!doc.sheetId) {
+        const h = await db.collection(HISTORY).findOne(
+          { companyId, scope, productCodeLower: codeLower, sheetId: { $exists: true, $ne: '' } },
+          { sort: { at: -1 }, projection: { sheetId: 1 } },
+        )
+        histSheet = String(h?.sheetId ?? '')
+      }
+      const target = legacyTargetSheet(doc.sheetId as string | undefined, histSheet, defaultSheetId)
+      if (!target) { skipped++; continue }
+      // Borrado atómico: si otro equipo ya la movió, aquí no se encuentra.
+      const removed = await col.findOneAndDelete({ _id: doc._id, rowKey: { $in: ['', null] } })
+      const gone = (removed as { value?: unknown } | null)?.value ?? removed
+      if (!gone) continue
+      const qty = qtyOf(doc)
+      const key = { companyId, scope, productCodeLower: codeLower, rowKey: target }
+      await col.updateOne({ ...key, quantity: { $exists: false } }, { $set: { quantity: 1 } })
+      await col.updateOne(
+        key,
+        {
+          $inc: { quantity: qty },
+          $set: { receivedBy: doc.receivedBy ?? '', receivedAt: doc.receivedAt ?? new Date().toISOString(), sheetId: target },
+          $setOnInsert: { productCode: doc.productCode, ...(doc.trackingCode ? { trackingCode: doc.trackingCode } : {}) },
+        },
+        { upsert: true },
+      )
+      moved++
+    }
+    res.json({ moved, skipped })
+  } catch (err) {
+    console.error('[received] Error al migrar marcas por tabla:', err)
+    res.status(500).json({ message: 'No se pudieron separar las marcas por tabla.' })
+  }
+})
+
 receivedRouter.get('/history', async (req, res) => {
   const companyId = (req.query.companyId as string) || req.session?.companyId
   const scope = scopeOf(req.query.scope)
