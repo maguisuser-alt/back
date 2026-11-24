@@ -11,6 +11,7 @@ import { readAllowed } from '../lib/features.js'
 import { buildActivityFeed, type HistDoc, type LogDoc, type OpDoc } from '../lib/activity-feed.js'
 import { toLocationRef, recordMovement } from '../lib/locations.js'
 import { mainDescription, resolveProductCode } from '../lib/product-variant.js'
+import { fieldsFromDescription, findMarkedRow, selectedFields, type SheetColumnsConfig } from '../lib/mark-fields.js'
 
 /**
  * Lee los lugares configurados y si la función de lugares está habilitada para
@@ -863,20 +864,52 @@ operationsRouter.get('/activity/feed', async (req, res) => {
     // Nombres de las tablas DATA y de las recepciones usadas.
     const sheetIds = [...new Set(history.map((h) => h.sheetId).filter((v): v is string => typeof v === 'string' && !!v))]
     const scopeIds = [...new Set(history.map((h) => h.scope).filter((v): v is string => typeof v === 'string' && !!v))]
-    const [sheetDocs, scopeDocs] = await Promise.all([
+    // Registros de las marcas: descripción guardada del producto (respaldo si la
+    // fila ya no está en la tabla).
+    const markOps = [...new Set(history.map((h) => h.trackingCode).filter((v): v is string => typeof v === 'string' && !!v))]
+    const [sheetDocs, scopeDocs, settingsDoc, markOpDocs] = await Promise.all([
       sheetIds.length
-        ? db.collection('company_sheets').find({ companyId, id: { $in: sheetIds } }, { projection: { _id: 0, id: 1, sheetName: 1 } }).toArray()
+        ? db.collection('company_sheets').find({ companyId, id: { $in: sheetIds } }, { projection: { _id: 0, id: 1, sheetName: 1, columns: 1, rows: 1 } }).toArray()
         : Promise.resolve([]),
       scopeIds.length
         ? db.collection('received_scopes').find({ companyId, id: { $in: scopeIds } }, { projection: { _id: 0, id: 1, name: 1 } }).toArray()
         : Promise.resolve([]),
+      db.collection('company_settings').findOne({ companyId }, { projection: { _id: 0, 'dbSettings.columns': 1 } }),
+      markOps.length
+        ? getOperationsCollection().find({ trackingCode: { $in: markOps } }, { projection: { _id: 0, trackingCode: 1, 'lineaBlanca.productCode': 1, 'lineaBlanca.orderCode': 1, 'lineaBlanca.labelData.descripcion': 1 } }).toArray()
+        : Promise.resolve([]),
     ])
+    const colsBySheet = ((settingsDoc as { dbSettings?: { columns?: Record<string, SheetColumnsConfig> } } | null)?.dbSettings?.columns) ?? {}
+    const sheetData = new Map(sheetDocs.map((s) => [String(s.id), { headers: (s.columns as string[]) ?? [], rows: (s.rows as string[][]) ?? [] }]))
+    const descByOpProduct = new Map<string, string>()
+    for (const o of markOpDocs) {
+      for (const p of ((o.lineaBlanca as Array<{ productCode?: string; orderCode?: string; labelData?: { descripcion?: string } }>) ?? [])) {
+        const d = p.labelData?.descripcion
+        if (!d) continue
+        for (const c of [p.productCode, p.orderCode]) if (c) descByOpProduct.set(`${o.trackingCode}|${c.toLowerCase()}`, d)
+      }
+    }
+    // Columnas elegidas en "Columnas" de la tabla, tomadas de la fila marcada.
+    const fieldsOf = (h: HistDoc) => {
+      const code = String(h.productCode ?? '')
+      if (h.sheetId) {
+        const data = sheetData.get(h.sheetId)
+        const cols = colsBySheet[h.sheetId] ?? { codeColumn: 0, descColumn: -1, extraColumns: [] }
+        if (data) {
+          const row = findMarkedRow(data.rows, typeof cols.codeColumn === 'number' ? cols.codeColumn : 0, code, h.rowKey)
+          if (row) return selectedFields(row, data.headers, cols)
+        }
+      }
+      if (h.trackingCode) return fieldsFromDescription(descByOpProduct.get(`${h.trackingCode}|${code.toLowerCase()}`))
+      return []
+    }
     const items = buildActivityFeed({
       ops: ops as OpDoc[],
       history: history as HistDoc[],
       logs: logs as LogDoc[],
       sheets: new Map(sheetDocs.map((s) => [String(s.id), String(s.sheetName ?? '')])),
       scopes: new Map(scopeDocs.map((s) => [String(s.id), String(s.name ?? '')])),
+      fieldsOf,
       limit: lim,
     })
     res.json({ items })

@@ -29,6 +29,8 @@ export interface FeedItem {
   sheetName?: string
   /** Recepción en la que se marcó ('' = General). */
   scopeName?: string
+  /** Marcas: columnas elegidas en "Columnas" de la tabla (descripción, cliente…). */
+  fields?: Array<{ label: string; value: string }>
 }
 
 export interface OpDoc {
@@ -57,6 +59,7 @@ export interface HistDoc {
   trackingCode?: string
   sheetId?: string
   scope?: string
+  rowKey?: string
 }
 
 export interface LogDoc {
@@ -109,7 +112,10 @@ export function operationEvents(op: OpDoc): FeedItem[] {
 }
 
 /** Evento de una marca en la DATA. */
-export function markEvent(h: HistDoc, names: { sheets: Map<string, string>; scopes: Map<string, string> }): FeedItem | null {
+export function markEvent(
+  h: HistDoc,
+  names: { sheets: Map<string, string>; scopes: Map<string, string>; fieldsOf?: (h: HistDoc) => Array<{ label: string; value: string }> },
+): FeedItem | null {
   if (!valid(h.at) || !h.productCode) return null
   const before = Number(h.before) || 0
   const after = Number(h.after) || 0
@@ -129,6 +135,10 @@ export function markEvent(h: HistDoc, names: { sheets: Map<string, string>; scop
     sheetId: h.sheetId || undefined,
     sheetName: h.sheetId ? names.sheets.get(h.sheetId) : undefined,
     scopeName: h.scope ? (names.scopes.get(h.scope) ?? undefined) : undefined,
+    ...(() => {
+      const f = names.fieldsOf?.(h) ?? []
+      return f.length ? { fields: f } : {}
+    })(),
   }
 }
 
@@ -153,6 +163,8 @@ export function buildActivityFeed(input: {
   logs: LogDoc[]
   sheets: Map<string, string>
   scopes: Map<string, string>
+  /** Columnas elegidas de la fila marcada (opcional). */
+  fieldsOf?: (h: HistDoc) => Array<{ label: string; value: string }>
   limit: number
 }): FeedItem[] {
   const items: FeedItem[] = [
