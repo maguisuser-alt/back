@@ -3,6 +3,8 @@ import { uploadToDrive, deletePhotoStorage } from '../lib/drive-upload.js'
 import { getOperationsCollection } from '../lib/mongodb.js'
 import { getStepsForType, MULTI_PHOTO_STEPS, OPTIONAL_STEPS, FREE_STEPS, PRODUCT_CODE_STEPS, OPTIONAL_PRODUCT_CODE_STEPS, normalizeClientTimestamp, type OperationType, type PhotoRecord } from '../types.js'
 import { existingClientKeys, isDuplicateKey } from '../lib/photo-dedupe.js'
+import { refreshPhotoUrls } from '../lib/storage.js'
+import { isPhotoShared, referencedPhotoIdsExcept } from '../lib/photo-refs.js'
 
 export const photosRouter = Router()
 
@@ -31,6 +33,97 @@ photosRouter.delete('/:trackingCode/:photoIndex', async (req, res) => {
   } catch (err) {
     console.error('[photos] Error al eliminar:', err)
     res.status(500).json({ message: 'Error al eliminar la foto.' })
+  }
+})
+
+/** Hosts de los que el servidor puede leer una foto (solo nuestro almacenamiento). */
+const STORAGE_HOST = /(^|\.)(r2\.dev|r2\.cloudflarestorage\.com|githubusercontent\.com)$/i
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024
+
+/**
+ * GET /api/photos/:trackingCode/:photoIndex/image
+ * Devuelve los bytes de una foto ya guardada, desde nuestro servidor. El
+ * editor la necesita así: si la carga directo desde el almacenamiento, el
+ * navegador bloquea la exportación de la imagen editada (canvas "contaminado"
+ * por CORS) y el botón "Listo" se quedaba cargando sin guardar.
+ */
+photosRouter.get('/:trackingCode/:photoIndex/image', async (req, res) => {
+  const { trackingCode, photoIndex } = req.params
+  const idx = Number(photoIndex)
+  try {
+    const operation = await getOperationsCollection().findOne({ trackingCode }, { projection: { photos: 1 } })
+    if (!operation) { res.status(404).json({ message: 'Operación no encontrada.' }); return }
+    const photos = (operation.photos as PhotoRecord[]) ?? []
+    if (!Number.isInteger(idx) || idx < 0 || idx >= photos.length) { res.status(400).json({ message: 'Índice de foto inválido.' }); return }
+    const [fresh] = await refreshPhotoUrls([photos[idx]])
+    const url = fresh?.driveUrl ?? ''
+    let host = ''
+    try { host = new URL(url).hostname } catch { /* inválida */ }
+    if (!/^https:\/\//.test(url) || !STORAGE_HOST.test(host)) { res.status(404).json({ message: 'La foto aún no está disponible.' }); return }
+    const r = await fetch(url)
+    if (!r.ok) { res.status(502).json({ message: 'No se pudo leer la foto del almacenamiento.' }); return }
+    const type = r.headers.get('content-type') || 'image/jpeg'
+    if (!type.startsWith('image/')) { res.status(502).json({ message: 'El archivo no es una imagen.' }); return }
+    const buf = Buffer.from(await r.arrayBuffer())
+    if (buf.length > MAX_IMAGE_BYTES) { res.status(413).json({ message: 'La foto es demasiado grande para editarla.' }); return }
+    res.setHeader('Content-Type', type)
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.send(buf)
+  } catch (err) {
+    console.error('[photos] Error al leer la imagen:', err)
+    res.status(500).json({ message: 'Error al leer la foto.' })
+  }
+})
+
+/**
+ * PUT /api/photos/:trackingCode/:photoIndex/image
+ * Body: { base64Image, mimeType?, expectedFileId? }
+ * REEMPLAZA la imagen de una foto guardada (foto editada): misma posición,
+ * comentario, hora y grupo. Antes se subía como foto nueva y se borraba la
+ * original, lo que la movía de lugar y, si fallaba el borrado, la duplicaba.
+ * `expectedFileId` evita pisar otra foto si la lista cambió mientras se editaba.
+ */
+photosRouter.put('/:trackingCode/:photoIndex/image', async (req, res) => {
+  const { trackingCode, photoIndex } = req.params
+  const { base64Image, mimeType, expectedFileId } = req.body ?? {}
+  const idx = Number(photoIndex)
+  if (!base64Image || typeof base64Image !== 'string') { res.status(400).json({ message: 'base64Image es requerido.' }); return }
+  try {
+    const col = getOperationsCollection()
+    const operation = await col.findOne({ trackingCode })
+    if (!operation) { res.status(404).json({ message: 'Operación no encontrada.' }); return }
+    const photos = (operation.photos as PhotoRecord[]) ?? []
+    if (!Number.isInteger(idx) || idx < 0 || idx >= photos.length) { res.status(400).json({ message: 'Índice de foto inválido.' }); return }
+    const old = photos[idx]
+    if (typeof expectedFileId === 'string' && expectedFileId && old.fileId !== expectedFileId) {
+      res.status(409).json({ message: 'La foto cambió mientras se editaba. Vuelve a abrirla.' }); return
+    }
+    const subfolderName = operation.vehiclePlate
+      ? `${operation.operationType}_${operation.vehiclePlate}`
+      : `${operation.operationType}_${trackingCode}`
+    const fileName = `${trackingCode}_editada_${idx + 1}_${Date.now()}.jpg`
+    const up = await uploadToDrive({ base64Image, fileName, mimeType: mimeType || 'image/jpeg', subfolderName, companyId: operation.companyId as string | undefined })
+    if (up.status === 'error' || !up.driveUrl) {
+      res.status(503).json({ message: 'No se pudo subir la imagen editada. Reintenta en unos segundos.' }); return
+    }
+    // Solo se reemplaza si en esa posición sigue la MISMA foto (sin carrera).
+    const result = await col.updateOne(
+      { trackingCode, [`photos.${idx}.fileId`]: old.fileId },
+      { $set: { [`photos.${idx}.driveUrl`]: up.driveUrl, [`photos.${idx}.fileId`]: up.fileId ?? '', [`photos.${idx}.editedAt`]: new Date().toISOString(), updatedAt: new Date().toISOString() } },
+    )
+    if (result.matchedCount === 0) {
+      await deletePhotoStorage({ fileId: up.fileId, driveUrl: up.driveUrl }).catch(() => false)
+      res.status(409).json({ message: 'La foto cambió mientras se editaba. Vuelve a abrirla.' }); return
+    }
+    // El archivo anterior se borra si ningún otro registro lo usa.
+    try {
+      const refs = await referencedPhotoIdsExcept({ companyId: operation.companyId as string | undefined, excludeOps: [trackingCode] })
+      if (!isPhotoShared(old, refs)) await deletePhotoStorage(old)
+    } catch { /* best-effort */ }
+    res.json({ message: 'Foto actualizada.', photo: { ...old, driveUrl: up.driveUrl, fileId: up.fileId ?? '' } })
+  } catch (err) {
+    console.error('[photos] Error al reemplazar la imagen:', err)
+    res.status(500).json({ message: 'Error al guardar la foto editada.' })
   }
 })
 
