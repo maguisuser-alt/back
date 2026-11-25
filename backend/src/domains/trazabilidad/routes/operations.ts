@@ -1444,27 +1444,10 @@ operationsRouter.patch('/:trackingCode/complete', async (req, res) => {
       return
     }
 
-    // Verifica que todos los pasos OBLIGATORIOS tengan al menos 1 foto
-    const steps = getStepsForType(operation.operationType as OperationType)
-    const opType = operation.operationType as OperationType
-    const optionalSteps = OPTIONAL_STEPS[opType] ?? []
-    const photos = operation.photos as PhotoRecord[]
-    const lineaBlanca = (operation.lineaBlanca ?? []) as Array<{ photos: unknown[] }>
-    const completedSteps = new Set(photos.map((p) => p.stepIndex))
-
-    for (let i = 0; i < steps.length; i++) {
-      if (optionalSteps.includes(i)) continue
-      if (!completedSteps.has(i)) {
-        res.status(400).json({ message: `Falta la foto del paso "${steps[i]}".`, missingStep: i })
-        return
-      }
-    }
-
-    // Requiere al menos 1 foto o 1 producto de línea blanca
-    if (photos.length === 0 && lineaBlanca.length === 0) {
-      res.status(400).json({ message: 'Debe tener al menos una foto o un producto registrado para completar.' })
-      return
-    }
+    // Sin restricciones: cualquier registro se puede completar (solo productos,
+    // solo fotos, o vacío), sea cual sea su tipo, incluidos los personalizados.
+    // Antes, los tipos creados en Ajustes (p. ej. devoluciones) exigían la foto
+    // del paso "Registro fotográfico" y bloqueaban registros con solo productos.
 
     const completedAt = normalizeClientTimestamp(clientTimestamp)
     await col.updateOne(

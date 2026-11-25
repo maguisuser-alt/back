@@ -35,6 +35,16 @@ export const FREE_STEPS: Record<OperationType, number[]> = {
   ACTIVIDAD: [0],
 }
 
+/**
+ * Config de pasos para un tipo. Los tipos personalizados (creados en Ajustes,
+ * p. ej. "DEVOLUCIONES") no están en los mapas: se tratan como los de fábrica
+ * (paso 0 libre, opcional y multi-foto). Sin este default, un tipo nuevo exigía
+ * foto obligatoria para completar y cada foto nueva REEMPLAZABA a la anterior.
+ */
+export function stepsOf(map: Record<OperationType, number[]>, type: string): number[] {
+  return (map as Record<string, number[] | undefined>)[type] ?? [0]
+}
+
 /** Pasos para revisión de Línea Blanca — ya no se usa como secuencia fija */
 export const LINEA_BLANCA_STEPS = [
   'Registro fotográfico',

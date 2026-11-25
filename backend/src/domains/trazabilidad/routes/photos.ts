@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { uploadToDrive, deletePhotoStorage } from '../lib/drive-upload.js'
 import { getOperationsCollection } from '../lib/mongodb.js'
-import { getStepsForType, MULTI_PHOTO_STEPS, OPTIONAL_STEPS, FREE_STEPS, PRODUCT_CODE_STEPS, OPTIONAL_PRODUCT_CODE_STEPS, normalizeClientTimestamp, type OperationType, type PhotoRecord } from '../types.js'
+import { getStepsForType, stepsOf, MULTI_PHOTO_STEPS, OPTIONAL_STEPS, FREE_STEPS, PRODUCT_CODE_STEPS, OPTIONAL_PRODUCT_CODE_STEPS, normalizeClientTimestamp, type OperationType, type PhotoRecord } from '../types.js'
 import { existingClientKeys, isDuplicateKey } from '../lib/photo-dedupe.js'
 import { refreshPhotoUrls } from '../lib/storage.js'
 import { isPhotoShared, referencedPhotoIdsExcept } from '../lib/photo-refs.js'
@@ -185,11 +185,11 @@ photosRouter.post('/upload', async (req, res) => {
     const idx = Number(stepIndex)
     if (idx < 0 || idx >= steps.length) { res.status(400).json({ message: `stepIndex inválido (0-${steps.length - 1}).` }); return }
 
-    const isMultiPhotoStep = MULTI_PHOTO_STEPS[opType]?.includes(idx) ?? false
+    const isMultiPhotoStep = stepsOf(MULTI_PHOTO_STEPS, opType).includes(idx)
 
     const existingPhotos = (operation.photos as PhotoRecord[]) ?? []
-    const optionalSteps = OPTIONAL_STEPS[opType] ?? []
-    const freeSteps = FREE_STEPS[opType] ?? []
+    const optionalSteps = stepsOf(OPTIONAL_STEPS, opType)
+    const freeSteps = stepsOf(FREE_STEPS, opType)
 
     // Pasos libres (acontecimiento): sin restricción de secuencia
     // Otros pasos: verifica secuencia buscando el paso requerido anterior
